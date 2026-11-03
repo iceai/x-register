@@ -680,13 +680,11 @@ def _next(page: Any, *, required: bool = True, cancel: Callable[[], bool]) -> bo
     # elements. Playwright's :text-is() therefore does not match the parent
     # button, while :has-text('Continue') would also match Continue with phone,
     # Google and Apple. Resolve the visible button by its exact rendered text.
-    exact_button = _find_exact_text_button(
+    if _click_exact_action(
         page,
         ("Continue", "继续", "Next", "下一步"),
-    )
-    if exact_button is not None:
-        _cancelled(cancel)
-        exact_button.click(timeout=10_000)
+        cancel=cancel,
+    ):
         return True
     return _click(
         page,
