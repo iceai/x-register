@@ -35,6 +35,9 @@ EMAIL_INPUT_SELECTORS = (
 # “Email or username”。新版输入框目前使用 name=text，另外保留可访问属性选择器，
 # 避免只依赖易变的 CSS class。
 EMAIL_FIRST_INPUT_SELECTORS = (
+    "input[name='username_or_email']",
+    "input[autocomplete='username webauthn']",
+    "input[autocomplete~='webauthn']",
     "input[aria-label='Email or username']",
     "input[placeholder='Email or username']",
     "input[aria-label='邮箱或用户名']",
@@ -47,6 +50,12 @@ UNIFIED_IDENTITY_INPUT_SELECTORS = (
     "input[name='username_or_email']",
     "input[autocomplete='username webauthn']",
     "input[autocomplete~='webauthn']",
+)
+USERNAME_INPUT_SELECTORS = (
+    "input[name='username']",
+    "input[placeholder='Username']",
+    "input[aria-label='Username']",
+    "input[autocomplete='username']:not([name='username_or_email'])",
 )
 CREATE_ACCOUNT_SELECTORS = (
     "[data-testid='ocfSignupButton']",
@@ -206,10 +215,6 @@ def _find(page: Any, selectors: Iterable[str]) -> Any | None:
 
 def _find_email_first_input(page: Any) -> Any | None:
     """Locate X's email-first textbox even when attributes or frame placement change."""
-    # X's unified landing uses this control for the begin_login API. Despite the
-    # visible "Email or username" copy, it is not an email-registration field.
-    if _find(page, UNIFIED_IDENTITY_INPUT_SELECTORS) is not None:
-        return None
     locator = _find(page, EMAIL_FIRST_INPUT_SELECTORS)
     if locator is not None:
         return locator
@@ -258,6 +263,106 @@ def _find_email_first_input(page: Any) -> Any | None:
     return None
 
 
+def _is_verification_code_page(page: Any) -> bool:
+    """Recognize X's email OTP route without confusing a phone field for a code."""
+    try:
+        url = str(page.url or "").lower()
+    except Exception:
+        url = ""
+    if "verify_code" in url or "verification_code" in url:
+        return True
+    text = _body_text(page).lower()
+    return any(
+        marker in text
+        for marker in (
+            "we sent you a security code",
+            "enter the code we sent",
+            "我们向你发送了安全码",
+            "输入我们发送的验证码",
+        )
+    )
+
+
+def _find_verification_code_inputs(page: Any) -> list[Any]:
+    """Return the visible single or multi-box inputs used by X's email OTP page."""
+    on_code_page = _is_verification_code_page(page)
+    for _scope_label, scope in _iter_page_scopes(page):
+        try:
+            inputs = scope.locator("input")
+            input_count = min(int(inputs.count()), 20)
+        except Exception:
+            continue
+        candidates: list[Any] = []
+        for index in range(input_count):
+            try:
+                candidate = inputs.nth(index)
+                if not _visible(candidate):
+                    continue
+                input_type = str(candidate.get_attribute("type") or "text").lower()
+                input_name = str(candidate.get_attribute("name") or "").lower()
+                autocomplete = str(
+                    candidate.get_attribute("autocomplete") or ""
+                ).lower()
+                inputmode = str(candidate.get_attribute("inputmode") or "").lower()
+                maxlength = str(candidate.get_attribute("maxlength") or "")
+            except Exception:
+                continue
+            if "phone" in input_name or input_type == "password":
+                continue
+            explicitly_code = (
+                "code" in input_name
+                or autocomplete == "one-time-code"
+                or maxlength == "1"
+            )
+            numeric_code_box = inputmode in {"numeric", "decimal"} and input_type in {
+                "text",
+                "tel",
+                "number",
+            }
+            if explicitly_code or numeric_code_box or (
+                on_code_page and input_type in {"text", "tel", "number"}
+            ):
+                candidates.append(candidate)
+        if candidates:
+            return candidates
+    return []
+
+
+def _wait_for_verification_code_inputs(
+    page: Any,
+    *,
+    timeout: float,
+    cancel: Callable[[], bool],
+) -> list[Any]:
+    deadline = time.time() + max(float(timeout), 1.0)
+    while time.time() < deadline:
+        _cancelled(cancel)
+        reason = _challenge_reason(page)
+        if reason:
+            raise ManualChallengeRequired(reason)
+        inputs = _find_verification_code_inputs(page)
+        if inputs:
+            return inputs
+        if not _is_verification_code_page(page) and _find(
+            page, PHONE_INPUT_SELECTORS
+        ) is not None:
+            raise PhoneVerificationRequired("X.com 要求手机号验证，当前任务仅配置了邮箱注册")
+        time.sleep(0.25)
+    _emit_timeout_diagnostics(page, CODE_INPUT_SELECTORS + ("input[maxlength='1']",))
+    raise XAccountRegistrationError("等待 X.com 邮箱验证码输入框超时")
+
+
+def _fill_verification_code_inputs(inputs: list[Any], code: str) -> None:
+    normalized = re.sub(r"\D", "", str(code or "")) or str(code or "").strip()
+    if not normalized:
+        raise XAccountRegistrationError("邮箱验证码为空")
+    if len(inputs) > 1 and len(inputs) >= len(normalized):
+        for locator, character in zip(inputs, normalized):
+            locator.fill(str(character))
+        return
+    _fill(inputs[0], normalized)
+
+
 def _find_exact_text_button(page: Any, labels: Iterable[str]) -> Any | None:
     """Find a visible button by its rendered text, including nested-label variants."""
     expected = {
@@ -278,6 +383,13 @@ def _find_exact_text_button(page: Any, labels: Iterable[str]) -> Any | None:
                 candidate = buttons.nth(index)
                 if not candidate.is_visible():
                     continue
+                try:
+                    if not candidate.is_enabled() or str(
+                        candidate.get_attribute("aria-disabled") or ""
+                    ).lower() == "true":
+                        continue
+                except Exception:
+                    pass
                 rendered_text = re.sub(
                     r"\s+", " ", str(candidate.inner_text(timeout=500) or "")
                 ).strip().casefold()
@@ -288,80 +400,40 @@ def _find_exact_text_button(page: Any, labels: Iterable[str]) -> Any | None:
     return None
 
 
-def _is_unified_signup_landing(page: Any) -> bool:
-    """Return true for X's new signup modal whose email box actually logs in."""
-    # X initially redirects with ?mode=signup, then removes the query string
-    # while keeping the same React view. The stable discriminator is the exact
-    # identity control used by jf.x.com's begin_login action.
-    return _find(page, UNIFIED_IDENTITY_INPUT_SELECTORS) is not None
-
-
-def _enter_email_signup_from_unified_landing(
+def _click_exact_action(
     page: Any,
-    log: Callable[[str], None],
+    labels: Iterable[str],
+    *,
     cancel: Callable[[], bool],
-) -> None:
-    """Enter X's actual signup branch and switch from phone to email when offered."""
-    log("[*] 已识别 X.com 新版统一登录/注册页，进入官方注册分支")
-    deadline = time.time() + 12
-    phone_entry = None
-    while time.time() < deadline:
-        _cancelled(cancel)
-        phone_entry = _find_exact_text_button(
-            page,
-            ("Continue with phone", "使用手机号继续"),
-        )
-        if phone_entry is not None:
-            break
-        time.sleep(0.25)
-    if phone_entry is None:
-        _emit_timeout_diagnostics(page, ("button:has-text('Continue with phone')",))
-        raise XAccountRegistrationError("X.com 新版注册入口未出现")
-    phone_entry.click(timeout=10_000)
+) -> bool:
+    """Click an exact action label, including link/span controls in onboarding."""
+    _cancelled(cancel)
+    action = _find_exact_text_button(page, labels)
+    if action is not None:
+        action.click(timeout=10_000)
+        return True
+    for label in labels:
+        label_text = str(label or "").strip()
+        if not label_text:
+            continue
+        for _scope_label, scope in _iter_page_scopes(page):
+            try:
+                candidate = scope.get_by_text(label_text, exact=True)
+                if not _visible(candidate):
+                    continue
+                candidate.first.click(timeout=10_000)
+                return True
+            except Exception:
+                continue
+    return False
 
-    # Older variants expose Use email instead after entering the phone branch.
-    # Current X may omit it entirely and require SMS; do not consume a temporary
-    # email until we have confirmed that an email registration form exists.
-    phone_input = None
-    deadline = time.time() + 12
-    while time.time() < deadline:
-        _cancelled(cancel)
-        email_input = _find(page, EMAIL_INPUT_SELECTORS)
-        if email_input is not None:
-            log("[*] X.com 注册分支已提供邮箱输入框")
-            return
-        use_email = _find_exact_text_button(
-            page,
-            ("Use email instead", "使用邮箱", "改用电子邮件"),
-        )
-        if use_email is not None:
-            use_email.click(timeout=10_000)
-            _wait_for(page, EMAIL_INPUT_SELECTORS, timeout=12, cancel=cancel)
-            log("[*] 已从 X.com 手机注册页切换为邮箱注册")
-            return
-        phone_input = _find(page, PHONE_INPUT_SELECTORS)
-        if phone_input is not None:
-            # Give late-rendered alternatives a short chance to appear.
-            time.sleep(2)
-            use_email = _find_exact_text_button(
-                page,
-                ("Use email instead", "使用邮箱", "改用电子邮件"),
-            )
-            if use_email is not None:
-                use_email.click(timeout=10_000)
-                _wait_for(page, EMAIL_INPUT_SELECTORS, timeout=12, cancel=cancel)
-                log("[*] 已从 X.com 手机注册页切换为邮箱注册")
-                return
-            break
-        time.sleep(0.25)
 
-    if phone_input is not None:
-        raise PhoneVerificationRequired(
-            "X.com 当前官方注册页仅提供手机号和短信验证，没有“Use email instead”；"
-            "临时邮箱无法单独完成本次注册"
-        )
-    _emit_timeout_diagnostics(page, PHONE_INPUT_SELECTORS + EMAIL_INPUT_SELECTORS)
-    raise XAccountRegistrationError("进入 X.com 官方注册分支后未出现手机号或邮箱控件")
+def _is_unified_signup_landing(page: Any) -> bool:
+    """Return true for X's unified email-first signup landing."""
+    # Despite the jf.x.com action being named begin_login, an unknown email in
+    # this signup context is sent directly to the email-code registration step.
+    # The user-recorded official flow confirms this is the intended email path.
+    return _find(page, UNIFIED_IDENTITY_INPUT_SELECTORS) is not None
 
 
 def _diagnostic_attr(locator: Any, name: str) -> str:
@@ -616,7 +688,7 @@ def _prepare_signup_form(page: Any, log: Callable[[str], None], cancel: Callable
         log("[*] 已识别 X.com 资料优先注册页")
         return
     if _is_unified_signup_landing(page):
-        _enter_email_signup_from_unified_landing(page, log, cancel)
+        log("[*] 已识别 X.com 新版统一邮箱注册入口")
         return
     if _find_email_first_input(page) is not None:
         log("[*] 已识别 X.com 邮箱优先注册页")
@@ -637,7 +709,7 @@ def _prepare_signup_form(page: Any, log: Callable[[str], None], cancel: Callable
         log("[*] 已识别 X.com 资料优先注册页")
         return
     if _is_unified_signup_landing(page):
-        _enter_email_signup_from_unified_landing(page, log, cancel)
+        log("[*] 已识别 X.com 新版统一邮箱注册入口")
         return
     if _find_email_first_input(page) is not None:
         log("[*] 已识别 X.com 邮箱优先注册页")
@@ -832,7 +904,7 @@ def _wait_for_email_verification_step(
             raise ManualChallengeRequired(reason)
         _raise_if_email_rejected(page, email)
 
-        if _find(page, CODE_INPUT_SELECTORS + ("input[type='tel']",)) is not None:
+        if _find_verification_code_inputs(page):
             return
         if _find(page, PHONE_INPUT_SELECTORS) is not None:
             raise PhoneVerificationRequired("X.com 要求手机号验证，当前任务仅配置了邮箱注册")
@@ -1001,33 +1073,22 @@ def fill_code_and_submit(
     cancel = cancel_callback or (lambda: False)
     page = _raw_page(log, cancel)
 
-    verification_input = _wait_for(
+    verification_inputs = _wait_for_verification_code_inputs(
         page,
-        CODE_INPUT_SELECTORS + ("input[type='tel']",) + PHONE_INPUT_SELECTORS,
         timeout=min(max(float(timeout), 1), 45),
         cancel=cancel,
     )
-    try:
-        input_type = str(verification_input.get_attribute("type") or "").lower()
-        input_name = str(verification_input.get_attribute("name") or "").lower()
-        input_autocomplete = str(
-            verification_input.get_attribute("autocomplete") or ""
-        ).lower()
-    except Exception:
-        input_type = ""
-        input_name = ""
-        input_autocomplete = ""
-    is_code_input = "code" in input_name or input_autocomplete == "one-time-code"
-    if "phone" in input_name or (input_type == "tel" and not is_code_input):
-        raise PhoneVerificationRequired("X.com 要求手机号验证，当前任务仅配置了邮箱注册")
-    code_input = verification_input
+
     def resend_code():
         return _click(
             page,
             (
                 "[role='button']:has-text('Resend')",
                 "button:has-text('Resend')",
+                "[role='button']:text-is('Retry')",
+                "button:text-is('Retry')",
                 "[role='button']:has-text('重新发送')",
+                "[role='button']:has-text('重试')",
             ),
             timeout=3,
             required=False,
@@ -1046,8 +1107,24 @@ def fill_code_and_submit(
     if not code:
         raise XAccountRegistrationError("获取验证码失败")
     try:
-        _fill(code_input, str(code).replace("-", "").strip())
-        _next(page, cancel=cancel)
+        _fill_verification_code_inputs(
+            verification_inputs,
+            str(code).replace("-", "").strip(),
+        )
+        log(f"[*] 已填写 X.com {len(verification_inputs)} 个邮箱验证码输入框")
+
+        # The current six-box page auto-submits after the last digit. Wait for
+        # that transition before considering a manual Continue click, otherwise
+        # a late click can land on the DOB page's disabled Continue button.
+        auto_advance_deadline = time.time() + 5
+        while time.time() < auto_advance_deadline:
+            _cancelled(cancel)
+            if not _is_verification_code_page(page):
+                break
+            time.sleep(0.25)
+        if _is_verification_code_page(page):
+            _next(page, cancel=cancel)
+
         deadline = time.time() + 35
         profile = last_profile()
         while time.time() < deadline:
@@ -1055,11 +1132,17 @@ def fill_code_and_submit(
             reason = _challenge_reason(page)
             if reason:
                 raise ManualChallengeRequired(reason)
-            if _find(page, PHONE_INPUT_SELECTORS) is not None:
+            if not _is_verification_code_page(page) and _find(
+                page, PHONE_INPUT_SELECTORS
+            ) is not None:
                 raise PhoneVerificationRequired(
                     "X.com 要求手机号验证，当前任务仅配置了邮箱注册"
                 )
             if _find(page, PASSWORD_INPUT_SELECTORS) is not None:
+                break
+            if _find(page, USERNAME_INPUT_SELECTORS) is not None:
+                # The current unified profile page renders Name, Username and
+                # Password together; fill all three in fill_profile_and_submit.
                 break
             if _find(page, NAME_INPUT_SELECTORS) is not None:
                 _fill_name_and_birthdate_if_present(
@@ -1107,7 +1190,21 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
         cancel=cancel,
     )
     try:
+        name_input = _find(page, NAME_INPUT_SELECTORS)
+        username_input = _find(page, USERNAME_INPUT_SELECTORS)
+        if name_input is not None:
+            _fill(name_input, str(profile.get("display_name") or ""))
+        if username_input is not None:
+            email_local = last_acquired_email().split("@", 1)[0]
+            base = re.sub(r"[^A-Za-z0-9_]", "", email_local)[:9] or "xuser"
+            username = f"{base}{random.randint(10000, 99999)}"[:15]
+            _fill(username_input, username)
+            profile["username"] = username
+            _runtime.last_profile = profile
         _fill(password_input, str(password))
+        if username_input is not None:
+            # X validates username availability asynchronously.
+            time.sleep(1.25)
         _next(page, cancel=cancel)
     except engine.RegistrationCancelled:
         raise
@@ -1115,7 +1212,10 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
         raise
     except Exception as exc:
         raise engine.AccountRetryNeeded(f"X.com 密码提交失败: {exc}") from exc
-    log("[*] 已填写并提交 X.com 注册密码")
+    if profile.get("username"):
+        log("[*] 已填写并提交 X.com 姓名、用户名和注册密码")
+    else:
+        log("[*] 已填写并提交 X.com 注册密码")
     return profile
 
 
@@ -1126,8 +1226,7 @@ def wait_for_registration_completion(timeout=120, log_callback=None, cancel_call
     email = last_acquired_email()
     # 账号创建后可能继续进入头像、用户名等可跳过的引导。
     deadline = time.time() + max(float(timeout), 1)
-    started_at = time.time()
-    username = ""
+    username = str(last_profile().get("username") or "")
     last_log_at = 0.0
     while time.time() < deadline:
         _cancelled(cancel)
@@ -1158,50 +1257,58 @@ def wait_for_registration_completion(timeout=120, log_callback=None, cancel_call
             _runtime.last_profile = profile
             log("[+] X.com 注册页面已确认完成")
             return {"url": str(page.url or ""), "username": username}
-        username_input = _find(page, ("input[name='username']",))
-        if username_input is not None:
+        username_input = _find(page, USERNAME_INPUT_SELECTORS)
+        if username_input is not None and _find(page, PASSWORD_INPUT_SELECTORS) is None:
             base = re.sub(r"[^A-Za-z0-9_]", "", email.split("@", 1)[0])[:10] or "user"
             username = f"{base}{random.randint(1000, 9999)}"
             _fill(username_input, username)
             _next(page, cancel=cancel)
             time.sleep(1)
             continue
-        if _click(
+        current_url = str(page.url or "")
+        current_url_lower = current_url.lower()
+
+        if "signup_preferences" in current_url_lower:
+            if _next(page, required=False, cancel=cancel):
+                log("[*] 已提交 X.com 隐私偏好设置")
+                time.sleep(1)
+                continue
+
+        if _click_exact_action(
             page,
             (
-                "[role='button']:has-text('Skip for now')",
-                "[role='button']:has-text('Skip')",
-                "[role='button']:has-text('暂时跳过')",
-                "[role='button']:has-text('跳过')",
+                "Skip for now",
+                "Skip",
+                "Not Now",
+                "Not now",
+                "暂时跳过",
+                "跳过",
+                "暂不",
             ),
-            timeout=3,
-            required=False,
             cancel=cancel,
         ):
+            log("[*] 已跳过 X.com 可选的新账号引导步骤")
             time.sleep(1)
             continue
-        # 密码已提交且进入后续 onboarding，账号已经创建。
-        password_gone = _find(
-            page, PASSWORD_INPUT_SELECTORS
-        ) is None
-        code_gone = _find(
-            page,
-            CODE_INPUT_SELECTORS,
-        ) is None
-        if (
-            time.time() - started_at >= 5
-            and "/i/flow/" in str(page.url or "")
-            and password_gone
-            and code_gone
-        ):
-            profile = last_profile()
-            profile["username"] = username
-            _runtime.last_profile = profile
-            log("[+] X.com 账号已创建，进入后续引导")
-            return {"url": str(page.url or ""), "username": username}
+
+        # Some variants use Continue/Next rather than Skip for post-signup
+        # screens. Restrict this fallback to known onboarding routes so it
+        # cannot accidentally select the phone option on the landing page.
+        if any(
+            route in current_url_lower
+            for route in (
+                "post_signup",
+                "upload_photo",
+                "passkey_enrollment",
+                "enable_notifications",
+            )
+        ) and _next(page, required=False, cancel=cancel):
+            log("[*] 已继续 X.com 新账号引导")
+            time.sleep(1)
+            continue
         if time.time() - last_log_at >= 5:
             last_log_at = time.time()
-            log(f"[*] 等待 X.com 注册完成... url={str(page.url or '')[:100]}")
+            log(f"[*] 等待 X.com 注册完成... url={current_url[:100]}")
         time.sleep(0.5)
 
     raise engine.AccountRetryNeeded("X.com 账号创建后的引导流程未完成")

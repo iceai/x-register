@@ -81,7 +81,7 @@ class XAccountRegistrationTests(unittest.TestCase):
         wait_for.assert_not_called()
         log.assert_any_call("[*] 已识别 X.com 邮箱优先注册页")
 
-    def test_prepare_signup_form_enters_unified_signup_branch(self):
+    def test_prepare_signup_form_keeps_unified_email_path(self):
         page = mock.Mock()
         log = mock.Mock()
         cancel = mock.Mock(return_value=False)
@@ -89,11 +89,12 @@ class XAccountRegistrationTests(unittest.TestCase):
         with (
             mock.patch.object(flow, "_find", return_value=None),
             mock.patch.object(flow, "_is_unified_signup_landing", return_value=True),
-            mock.patch.object(flow, "_enter_email_signup_from_unified_landing") as enter,
+            mock.patch.object(flow, "_find_exact_text_button") as find_button,
         ):
             flow._prepare_signup_form(page, log, cancel)
 
-        enter.assert_called_once_with(page, log, cancel)
+        find_button.assert_not_called()
+        log.assert_any_call("[*] 已识别 X.com 新版统一邮箱注册入口")
 
     def test_unified_signup_detection_does_not_require_mode_query(self):
         page = mock.Mock()
@@ -103,39 +104,58 @@ class XAccountRegistrationTests(unittest.TestCase):
         with mock.patch.object(flow, "_find", return_value=identity_input):
             self.assertTrue(flow._is_unified_signup_landing(page))
 
-    def test_email_first_detection_rejects_unified_login_control(self):
+    def test_email_first_detection_accepts_unified_email_control(self):
         page = mock.Mock()
         identity_input = mock.Mock()
 
         with mock.patch.object(flow, "_find", return_value=identity_input) as find:
-            self.assertIsNone(flow._find_email_first_input(page))
+            self.assertIs(flow._find_email_first_input(page), identity_input)
 
-        find.assert_called_once_with(page, flow.UNIFIED_IDENTITY_INPUT_SELECTORS)
+        find.assert_called_once_with(page, flow.EMAIL_FIRST_INPUT_SELECTORS)
 
-    def test_unified_signup_without_email_switch_reports_phone_requirement(self):
+    def test_six_box_verification_code_is_filled_one_digit_per_input(self):
+        inputs = [mock.Mock() for _ in range(6)]
+
+        flow._fill_verification_code_inputs(inputs, "123456")
+
+        for locator, digit in zip(inputs, "123456"):
+            locator.fill.assert_called_once_with(digit)
+
+    def test_unified_profile_fills_name_username_and_password(self):
         page = mock.Mock()
-        phone_button = mock.Mock()
-        phone_input = mock.Mock()
+        password_input = mock.Mock()
+        name_input = mock.Mock()
+        username_input = mock.Mock()
+        profile = {"display_name": "Test Person", "password": "Strong-password-1"}
         log = mock.Mock()
         cancel = mock.Mock(return_value=False)
 
         with (
-            mock.patch.object(
-                flow,
-                "_find_exact_text_button",
-                side_effect=[phone_button, None, None],
-            ),
-            mock.patch.object(flow, "_find", side_effect=[None, phone_input]),
+            mock.patch.object(flow, "_raw_page", return_value=page),
+            mock.patch.object(flow, "last_profile", return_value=profile),
+            mock.patch.object(flow, "last_acquired_email", return_value="abc123@example.com"),
+            mock.patch.object(flow, "_wait_for", return_value=password_input),
+            mock.patch.object(flow, "_find", side_effect=[name_input, username_input]),
+            mock.patch.object(flow, "_fill") as fill,
+            mock.patch.object(flow, "_next") as next_step,
+            mock.patch.object(flow.random, "randint", return_value=12345),
             mock.patch.object(flow.time, "sleep"),
         ):
-            with self.assertRaises(flow.PhoneVerificationRequired):
-                flow._enter_email_signup_from_unified_landing(
-                    page,
-                    log,
-                    cancel,
-                )
+            result = flow.fill_profile_and_submit(
+                log_callback=log,
+                cancel_callback=cancel,
+            )
 
-        phone_button.click.assert_called_once_with(timeout=10_000)
+        self.assertEqual(result["username"], "abc12312345")
+        self.assertEqual(
+            fill.call_args_list,
+            [
+                mock.call(name_input, "Test Person"),
+                mock.call(username_input, "abc12312345"),
+                mock.call(password_input, "Strong-password-1"),
+            ],
+        )
+        next_step.assert_called_once_with(page, cancel=cancel)
 
     def test_next_uses_exact_continue_selector(self):
         with (
