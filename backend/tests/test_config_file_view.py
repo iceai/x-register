@@ -63,22 +63,6 @@ class ProxyConfigUpdateTests(unittest.TestCase):
         self.assertIn("网络代理格式错误", str(raised.exception.detail))
         save.assert_not_called()
 
-    def test_sso_detailed_risk_switch_is_public_and_saved_as_boolean(self):
-        with patch.object(gr, "load_config"), patch.object(gr, "save_config") as save:
-            result = _apply_config_updates({"sso_detailed_risk_check": True})
-
-        self.assertIs(gr.config["sso_detailed_risk_check"], True)
-        self.assertIs(result["config"]["sso_detailed_risk_check"], True)
-        save.assert_called_once_with()
-
-    def test_cpa_registration_risk_switch_is_public_and_saved_as_boolean(self):
-        with patch.object(gr, "load_config"), patch.object(gr, "save_config") as save:
-            result = _apply_config_updates({"cpa_registration_risk_check": True})
-
-        self.assertIs(gr.config["cpa_registration_risk_check"], True)
-        self.assertIs(result["config"]["cpa_registration_risk_check"], True)
-        save.assert_called_once_with()
-
     def test_low_traffic_switch_is_public_and_saved_as_boolean(self):
         with patch.object(gr, "load_config"), patch.object(gr, "save_config") as save:
             result = _apply_config_updates({"browser_low_traffic_mode": True})

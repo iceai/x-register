@@ -16,12 +16,23 @@ from typing import Any, Deque, Dict, List, Optional
 class RegistrationJobCoordinator:
     """Single-flight registration runner with ring-buffer logs."""
 
-    def __init__(self, max_logs: int = 2000):
+    _global_start_lock = threading.RLock()
+    _active_coordinator: Optional["RegistrationJobCoordinator"] = None
+
+    def __init__(
+        self,
+        max_logs: int = 2000,
+        *,
+        service_kind: str = "x_registration",
+        source: str = "web",
+        persist_snapshot: bool = True,
+        thread_name: str = "web-registration",
+    ):
         self._lock = threading.RLock()
         self._logs: Deque[Dict[str, Any]] = collections.deque(maxlen=max(100, int(max_logs)))
         self._log_seq = 0
         self._running = False
-        self._stop_controller = None
+        self._stop_controller: Any = None
         self._stop_requested_before_controller = False
         self._thread: Optional[threading.Thread] = None
         self._started_at: Optional[float] = None
@@ -29,7 +40,11 @@ class RegistrationJobCoordinator:
         self._last_error = ""
         self._target_count = 0
         self._workers = 1
-        self._source = "web"
+        self._service_kind = service_kind
+        self._default_source = source
+        self._persist_snapshot_enabled = persist_snapshot
+        self._thread_name = thread_name
+        self._source = source
         self._completed_count = 0
         self._success_count = 0
         self._failure_count = 0
@@ -40,11 +55,18 @@ class RegistrationJobCoordinator:
         self._last_persist_at = 0.0
         self._last_persisted_completed = -1
 
+    def _service(self):
+        if self._service_kind == "x_account":
+            from backend.x_account_registration.service import x_account_registration_service
+
+            return x_account_registration_service
+        from backend.x_registration.service import x_registration_service
+
+        return x_registration_service
+
     def _repository(self):
         try:
-            from backend.registration import engine as gr
-
-            return gr.get_registration_repository()
+            return self._service().repository()
         except Exception:
             return None
 
@@ -67,6 +89,8 @@ class RegistrationJobCoordinator:
 
     def _persist_snapshot(self, *, force: bool = False) -> None:
         """把当前任务摘要写入 SQLite；默认对进度变更做轻量节流。"""
+        if not self._persist_snapshot_enabled:
+            return
         now = time.time()
         with self._lock:
             completed = self._completed_count
@@ -94,6 +118,8 @@ class RegistrationJobCoordinator:
             if self._restored:
                 return
             self._restored = True
+        if not self._persist_snapshot_enabled:
+            return
         repo = self._repository()
         if repo is None:
             return
@@ -154,10 +180,8 @@ class RegistrationJobCoordinator:
             ("创建邮箱并提交", "创建并提交邮箱"),
             ("拉取验证码", "等待邮箱验证码"),
             ("填写资料", "填写账号资料"),
-            ("等待 sso", "等待登录凭证"),
-            ("开启 NSFW", "更新账号设置"),
-            ("SSO→auth", "转换并写入授权"),
-            ("[CPA]", "写入 CPA 授权"),
+            ("确认注册完成", "确认注册结果"),
+            ("等待注册完成", "确认注册结果"),
             ("下一个账号前等待", "等待下一账号"),
         )
         changed = False
@@ -177,7 +201,6 @@ class RegistrationJobCoordinator:
             failure = any(
                 marker in text
                 for marker in (
-                    "注册未计成功 [CPA失败]",
                     "[-] 域名拒绝:",
                     "[-] 邮箱域名被",
                     "[-] 卡住跳过:",
@@ -264,31 +287,43 @@ class RegistrationJobCoordinator:
             self._logs.clear()
 
     def start(self, count: int = 1, workers: int = 1) -> Dict[str, Any]:
-        from backend.registration import engine as gr
+        service = self._service()
+        gr = service.runtime
 
         self.restore_from_database()
         gr._bs.allow_browser_launches()
         count = max(1, min(int(count or 1), 1000))
         workers = max(1, min(int(workers or 1), 8, count))
+        if self._service_kind == "x_account":
+            workers = 1
 
-        with self._lock:
-            if self._running:
-                raise RuntimeError("已有注册任务在运行")
-            self._running = True
-            self._started_at = time.time()
-            self._finished_at = None
-            self._last_error = ""
-            self._target_count = count
-            self._workers = workers
-            self._stop_controller = None
-            self._stop_requested_before_controller = False
-            self._completed_count = 0
-            self._success_count = 0
-            self._failure_count = 0
-            self._current_stage = "任务启动中"
-            self._current_email = ""
-            self._batch_id = ""
-            self._append_log(f"[*] Web 任务启动：数量={count} 并发={workers}")
+        coordinator_type = type(self)
+        with coordinator_type._global_start_lock:
+            active = coordinator_type._active_coordinator
+            if active is not None and active is not self:
+                with active._lock:
+                    if active._running:
+                        raise RuntimeError("另一个注册任务正在运行")
+            with self._lock:
+                if self._running:
+                    raise RuntimeError("已有注册任务在运行")
+                self._running = True
+                self._started_at = time.time()
+                self._finished_at = None
+                self._last_error = ""
+                self._target_count = count
+                self._workers = workers
+                self._source = self._default_source
+                self._stop_controller = None
+                self._stop_requested_before_controller = False
+                self._completed_count = 0
+                self._success_count = 0
+                self._failure_count = 0
+                self._current_stage = "任务启动中"
+                self._current_email = ""
+                self._batch_id = ""
+                self._append_log(f"[*] Web 任务启动：数量={count} 并发={workers}")
+            coordinator_type._active_coordinator = self
 
         self._persist_snapshot(force=True)
 
@@ -322,7 +357,7 @@ class RegistrationJobCoordinator:
                 manager._append_log(str(message or ""))
 
             try:
-                gr.load_config()
+                service.load_config()
                 gr._wire_runtime_modules()
                 gr.config["register_count"] = count
                 gr.config["register_workers"] = workers
@@ -349,7 +384,7 @@ class RegistrationJobCoordinator:
 
                 gr.new_registration_batch_id = capture_batch_id
                 try:
-                    gr.run_registration(count_local)
+                    service.run(count_local)
                 finally:
                     gr.new_registration_batch_id = original_new_batch_id
             except Exception as exc:
@@ -371,11 +406,23 @@ class RegistrationJobCoordinator:
                         if manager._completed_count < manager._target_count
                         else "任务已完成"
                     )
+                with type(manager)._global_start_lock:
+                    if type(manager)._active_coordinator is manager:
+                        type(manager)._active_coordinator = None
                 manager._append_log("[*] Web 任务已结束")
                 manager._persist_snapshot(force=True)
 
-        self._thread = threading.Thread(target=runner, name="web-registration", daemon=True)
-        self._thread.start()
+        self._thread = threading.Thread(target=runner, name=self._thread_name, daemon=True)
+        try:
+            self._thread.start()
+        except Exception:
+            with self._lock:
+                self._running = False
+                self._finished_at = time.time()
+            with type(self)._global_start_lock:
+                if type(self)._active_coordinator is self:
+                    type(self)._active_coordinator = None
+            raise
         return self.status()
 
     def request_stop(self) -> Dict[str, Any]:

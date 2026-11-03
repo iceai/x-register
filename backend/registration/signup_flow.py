@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """注册页面步骤。
 
-封装打开页面、邮箱验证、资料提交、挑战处理及 SSO 凭据等待等浏览器交互。
+封装打开页面、邮箱验证、资料提交、挑战处理及注册完成确认等浏览器交互。
 """
 from __future__ import annotations
 
@@ -502,11 +502,11 @@ def _active_or_new_signup_page(log_callback=None, cancel_callback=None, *, resta
         if log_callback:
             log_callback("[*] 浏览器已启动")
     _prepare_exit_ip(log_callback)
-    browser_obj = active_browser()
+    browser_obj: Any = active_browser()
     if browser_obj is None:
         raise Exception("浏览器启动失败")
     try:
-        tabs = browser_obj.get_tabs() if browser_obj is not None else []
+        tabs = browser_obj.get_tabs()
         page_obj = tabs[-1] if tabs else browser_obj.new_tab()
     except Exception:
         page_obj = browser_obj.new_tab()
@@ -586,9 +586,9 @@ def open_signup_page(log_callback=None, cancel_callback=None):
         raise Exception(last_error or "打开注册页失败")
 
     sleep_with_cancel(0.4, cancel_callback)
-    if log_callback:
-        log_callback(f"[*] 当前URL: {active_page().url if active_page() else ''}")
     current_page = active_page() or page_obj
+    if log_callback:
+        log_callback(f"[*] 当前URL: {current_page.url if current_page else ''}")
     state = _signup_page_state(current_page)
     if state.get("email_form"):
         if log_callback:
@@ -2073,7 +2073,8 @@ return { notices: Array.from(new Set(notices)).slice(0, 20), body, url: location
         return ""
     if not isinstance(payload, dict):
         return ""
-    notices = payload.get("notices") if isinstance(payload.get("notices"), list) else []
+    raw_notices = payload.get("notices")
+    notices: list[Any] = raw_notices if isinstance(raw_notices, list) else []
     candidates = [str(item or "").strip() for item in notices if str(item or "").strip()]
     body = str(payload.get("body") or "").strip()
     if body:
@@ -2087,7 +2088,8 @@ return { notices: Array.from(new Set(notices)).slice(0, 20), body, url: location
                 start = max(match.start() - 120, 0)
                 end = min(match.end() + 180, len(text))
                 return text[start:end]
-    signature = payload.get("signature") if isinstance(payload.get("signature"), dict) else {}
+    raw_signature = payload.get("signature")
+    signature: dict[str, Any] = raw_signature if isinstance(raw_signature, dict) else {}
     if signature.get("matched"):
         signature_text = str(signature.get("text") or "").strip()
         signature_name = str(signature.get("name") or "existing-account-card").strip()
@@ -2095,157 +2097,76 @@ return { notices: Array.from(new Set(notices)).slice(0, 20), body, url: location
     return ""
 
 
-def wait_for_sso_cookie(timeout=55, log_callback=None, cancel_callback=None):
-    """等注册完成后的 sso cookie。
+def wait_for_registration_completion(timeout=55, log_callback=None, cancel_callback=None):
+    """等待资料提交后的注册跳转完成，不读取或导出任何登录凭据。
 
-    关键：不要一看到「正在登录」就强制 page.get(grok.com)，
-    那会打断 accounts.x.ai 的 redirect / Set-Cookie 链，导致 grok.com 只剩匿名 cookie。
-    策略：accounts 短 hold（~7s）→ 点继续 → 轻量跳 grok（最多 2 次）。
+    XRegistration 只保存注册账号本身。这里通过页面 URL、资料表单消失和
+    ``正在登录`` 提示确认站点已经接收注册，不读取任何登录凭据。
     """
     deadline = time.time() + max(int(timeout or 55), 20)
     started = time.time()
-    last_seen_names = set()
-    last_submit_retry = 0.0
-    last_cf_retry_at = 0.0
     last_heartbeat = 0.0
-    last_signin_log = 0.0
-    last_back_click = 0.0
-    last_grok_nudge = 0.0
     last_continue_click = 0.0
-    grok_nudge_count = 0
-    final_no_submit_state = ""
-    final_no_submit_since = None
-    final_no_submit_timeout = 18
-    # 短 hold：给 Set-Cookie 留窗口，又不拖慢成功路径
-    accounts_hold_seconds = 7
-    max_grok_nudges = 2
 
-    def _current_url():
+    def _page_state():
         try:
-            return str(getattr(page, "url", "") or "")
+            value = page.run_js(
+                r"""
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  const rect = node.getBoundingClientRect();
+  return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'
+    && rect.width > 0 && rect.height > 0;
+}
+const body = String(document.body && (document.body.innerText || document.body.textContent) || '')
+  .replace(/\s+/g, ' ').trim();
+const compact = body.replace(/\s+/g, '').toLowerCase();
+const profileInput = Array.from(document.querySelectorAll(
+  'input[data-testid="givenName"], input[name="givenName"], input[name="firstName"], input[autocomplete="given-name"], input[autocomplete="new-password"]'
+)).some(isVisible);
+const signingIn = compact.includes('正在登录') || compact.includes('您正在登录')
+  || compact.includes('signingyouin') || compact.includes('signingin')
+  || compact.includes('loggingin') || compact.includes('redirecting');
+return {
+  url: location.href,
+  profileInput,
+  signingIn,
+  body: body.slice(0, 500),
+};
+                """
+            )
         except Exception:
-            return ""
+            value = {}
+        return value if isinstance(value, dict) else {}
 
-    def _read_sso_from_cookies():
-        cookies = page.cookies(all_domains=True, all_info=True) or []
-        names = set()
-        sso_val = ""
-        sso_rw_val = ""
-        for item in cookies:
-            if isinstance(item, dict):
-                name = str(item.get("name", "")).strip()
-                value = str(item.get("value", "")).strip()
-            else:
-                name = str(getattr(item, "name", "")).strip()
-                value = str(getattr(item, "value", "")).strip()
-            if name:
-                names.add(name)
-            if name == "sso" and value and not sso_val:
-                sso_val = value
-            if name == "sso-rw" and value and not sso_rw_val:
-                sso_rw_val = value
-        # 优先 sso；少数情况下只有 sso-rw
-        return (sso_val or sso_rw_val), names
-
-    def _page_is_signing_in():
+    def _click_continue_if_any():
         try:
             return bool(
                 page.run_js(
                     r"""
-const t = ((document.body && document.body.innerText) || '').replace(/\s+/g, '');
-const lower = t.toLowerCase();
-return t.includes('您正在登录') || t.includes('正在登录')
-  || lower.includes('signingyouin') || lower.includes('signinginin')
-  || lower.includes('signing in') || lower.includes('logging in')
-  || lower.includes('redirecting');
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  const rect = node.getBoundingClientRect();
+  return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+}
+const nodes = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="submit"]'));
+const target = nodes.find((node) => {
+  if (!isVisible(node) || node.disabled) return false;
+  const text = String((node.innerText || node.textContent || '') + ' ' + (node.getAttribute('aria-label') || ''))
+    .replace(/\s+/g, '').toLowerCase();
+  return text.includes('继续') || text.includes('前往') || text.includes('开始使用')
+    || text.includes('continue') || text.includes('proceed') || text.includes('gotogrok');
+});
+if (!target) return false;
+target.click();
+return true;
                     """
                 )
             )
         except Exception:
             return False
-
-    def _click_continue_if_any():
-        """点「继续 / Continue / 前往 Grok」类按钮，推动自然 redirect。"""
-        try:
-            return page.run_js(
-                r"""
-function isVisible(node) {
-  if (!node) return false;
-  const style = window.getComputedStyle(node);
-  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-  const rect = node.getBoundingClientRect();
-  return rect.width > 0 && rect.height > 0;
-}
-const nodes = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="submit"]'));
-const btn = nodes.find((n) => {
-  if (!isVisible(n) || n.disabled) return false;
-  const t = ((n.innerText || n.textContent || '') + ' '
-    + (n.getAttribute('aria-label') || '') + ' '
-    + (n.getAttribute('href') || '')).replace(/\s+/g, ' ').trim().toLowerCase();
-  const compact = t.replace(/\s+/g, '');
-  if (compact.includes('返回') || t.includes('back') || t.includes('return')) return false;
-  return compact.includes('继续') || compact.includes('前往') || compact.includes('打开')
-    || t.includes('continue') || t.includes('proceed') || t.includes('go to')
-    || t.includes('grok.com') || compact.includes('开始使用');
-});
-if (!btn) return false;
-btn.click();
-return true;
-                """
-            )
-        except Exception:
-            return False
-
-    def _click_back_if_any():
-        try:
-            return page.run_js(
-                r"""
-function isVisible(node) {
-  if (!node) return false;
-  const style = window.getComputedStyle(node);
-  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-  const rect = node.getBoundingClientRect();
-  return rect.width > 0 && rect.height > 0;
-}
-const nodes = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-const btn = nodes.find((n) => {
-  if (!isVisible(n) || n.disabled) return false;
-  const t = ((n.innerText || n.textContent || '') + ' ' + (n.getAttribute('aria-label') || '')).replace(/\s+/g, '');
-  const lower = t.toLowerCase();
-  return t.includes('返回') || lower.includes('back') || lower.includes('return');
-});
-if (!btn) return false;
-btn.click();
-return true;
-                """
-            )
-        except Exception:
-            return False
-
-    def _nudge_grok_once(reason):
-        nonlocal grok_nudge_count, last_grok_nudge
-        if grok_nudge_count >= max_grok_nudges:
-            return ""
-        if log_callback:
-            log_callback(f"[*] {reason}，轻量打开 grok.com（第 {grok_nudge_count + 1}/{max_grok_nudges} 次）...")
-        try:
-            page.get("https://grok.com/")
-            try:
-                page.wait.doc_loaded()
-            except Exception:
-                pass
-            sleep_with_cancel(1.0, cancel_callback)
-            grok_nudge_count += 1
-            last_grok_nudge = time.time()
-            sso_val, names = _read_sso_from_cookies()
-            last_seen_names.update(names)
-            return sso_val
-        except Exception as nav_exc:
-            grok_nudge_count += 1
-            last_grok_nudge = time.time()
-            if log_callback:
-                log_callback(f"[Debug] 跳转 grok.com 取 sso 失败: {nav_exc}")
-            return ""
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -2255,433 +2176,47 @@ return true;
                 sleep_with_cancel(0.5, cancel_callback)
                 continue
 
-            now = time.time()
-            elapsed = now - started
-            cur_url = _current_url()
-            on_accounts = ("accounts.x.ai" in cur_url) or ("auth.x.ai" in cur_url)
-            on_grok = "grok.com" in cur_url
-
             registered_notice = detect_account_already_registered()
             if registered_notice:
-                if log_callback:
-                    log_callback(f"[-] 注册失败，账号已注册: {registered_notice}")
                 raise AccountAlreadyRegistered(f"账号已注册: {registered_notice}")
 
-            # 心跳：避免长时间无日志像卡死
+            state = _page_state()
+            url = str(state.get("url") or getattr(page, "url", "") or "")
+            elapsed = time.time() - started
+            profile_visible = bool(state.get("profileInput"))
+            signing_in = bool(state.get("signingIn"))
+            on_signup = "/sign-up" in url.lower()
+            on_target = "grok.com" in url.lower()
+
+            if (on_target and not on_signup) or (signing_in and not profile_visible):
+                if log_callback:
+                    log_callback("[+] 注册页面已确认完成")
+                return {"url": url, "elapsed_seconds": round(elapsed, 2)}
+
+            now = time.time()
+            if not profile_visible and now - last_continue_click >= 4:
+                last_continue_click = now
+                if _click_continue_if_any() and log_callback:
+                    log_callback("[*] 已点击继续，等待注册跳转完成...")
+
             if log_callback and now - last_heartbeat >= 5:
                 last_heartbeat = now
-                remain = max(int(deadline - now), 0)
+                remaining = max(int(deadline - now), 0)
                 log_callback(
-                    f"[*] 等待 sso 中... 已等 {int(elapsed)}s，剩余 {remain}s | url={cur_url[:90]}"
+                    f"[*] 等待注册完成... 已等 {int(elapsed)}s，剩余 {remaining}s | url={url[:90]}"
                 )
-
-            # 优先读 cookie（登录中页面也可能已写入 sso）
-            sso_val, names = _read_sso_from_cookies()
-            last_seen_names |= names
-            if sso_val:
-                if log_callback:
-                    log_callback("[*] 已获取到 sso cookie")
-                return sso_val
-
-            signin_hint = _page_is_signing_in()
-
-            # 阶段1：accounts 上「正在登录」→ 短 hold，禁止立刻跳 grok
-            if signin_hint and on_accounts and elapsed < accounts_hold_seconds:
-                if log_callback and now - last_signin_log >= 3:
-                    last_signin_log = now
-                    remain_hold = max(int(accounts_hold_seconds - elapsed), 0)
-                    log_callback(
-                        f"[*] 页面显示正在登录，先在 accounts.x.ai 等待 sso"
-                        f"（再等 {remain_hold}s 后可跳 grok.com）..."
-                    )
-                # hold 过半后再点「继续」，避免过早打断
-                if elapsed >= 3 and now - last_continue_click >= 4:
-                    last_continue_click = now
-                    if _click_continue_if_any() and log_callback:
-                        log_callback("[*] 已点击继续/前往类按钮，等待 redirect...")
-                sleep_with_cancel(0.4, cancel_callback)
-                continue
-
-            # 阶段2：hold 结束仍在 accounts 且无 sso → 先点继续，再轻量跳 grok（最多 2 次）
-            if on_accounts and elapsed >= accounts_hold_seconds:
-                if now - last_continue_click >= 5:
-                    last_continue_click = now
-                    if _click_continue_if_any() and log_callback:
-                        log_callback("[*] accounts 等待结束，已点击继续/前往类按钮...")
-                        sleep_with_cancel(1.2, cancel_callback)
-                        sso_val, names = _read_sso_from_cookies()
-                        last_seen_names |= names
-                        if sso_val:
-                            if log_callback:
-                                log_callback("[*] 已获取到 sso cookie")
-                            return sso_val
-                if (
-                    grok_nudge_count < max_grok_nudges
-                    and now - last_grok_nudge >= 8
-                    and (signin_hint or elapsed >= accounts_hold_seconds + 2)
-                ):
-                    sso_val = _nudge_grok_once("accounts 等待结束仍无 sso")
-                    if sso_val:
-                        if log_callback:
-                            log_callback("[*] 已获取到 sso cookie")
-                        return sso_val
-
-            # 阶段3：已在 grok.com 仍无 sso → 少次「返回」或再刷（不反复硬刷）
-            if on_grok and not sso_val:
-                if signin_hint and now - last_back_click >= 10:
-                    last_back_click = now
-                    if _click_back_if_any():
-                        if log_callback:
-                            log_callback("[*] grok 页无 sso，已点击「返回」尝试重新推进")
-                        sleep_with_cancel(0.8, cancel_callback)
-                elif (
-                    grok_nudge_count < max_grok_nudges
-                    and elapsed >= accounts_hold_seconds + 12
-                    and now - last_grok_nudge >= 10
-                ):
-                    sso_val = _nudge_grok_once("grok.com 仍为匿名会话")
-                    if sso_val:
-                        if log_callback:
-                            log_callback("[*] 已获取到 sso cookie")
-                        return sso_val
-
-            # 仍停留在“完成注册”页时，若 Cloudflare 已通过，周期性重试点击提交
-            if now - last_submit_retry >= 2.5:
-                retried = page.run_js(
-                    r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-const titleHit = !!Array.from(document.querySelectorAll('h1,h2,div,span')).find((el) => {
-    const t = (el.textContent || '').replace(/\s+/g, '');
-    const lower = t.toLowerCase();
-    return t.includes('完成注册') || lower.includes('completeyoursignup') || lower.includes('completesignup');
-});
-if (!titleHit) return 'not-final-page';
-
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-const cfPresent = !!cfInput
-  || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
-if (cfPresent) {
-    const token = String((cfInput && cfInput.value) || '').trim();
-    const solved = token.length >= 80;
-    if (!solved) return 'final-page-wait-cf:' + token.length;
-}
-
-function buttonText(node) {
-    return [
-        node.innerText,
-        node.textContent,
-        node.getAttribute('value'),
-        node.getAttribute('aria-label'),
-        node.getAttribute('title'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
-}
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]')).filter((node) => {
-    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
-});
-const submitBtn = buttons.find((node) => {
-    const t = buttonText(node).replace(/\s+/g, '').toLowerCase();
-    const testid = (node.getAttribute('data-testid') || '').toLowerCase();
-    if (testid.includes('submit') || testid.includes('signup') || testid.includes('register') || testid.includes('continue')) return true;
-    if (t.includes('完成注册') || t.includes('创建账户') || t.includes('signup') || t.includes('createaccount')) return true;
-    if (t.includes('registr') || t.includes('inscr') || t.includes('登録') || t.includes('finalizar')) return true;
-    return false;
-});
-if (!submitBtn) {
-    const visibleTexts = buttons.map(buttonText).filter(Boolean).slice(0, 8).join(' | ');
-    return 'final-page-no-submit:' + visibleTexts;
-}
-submitBtn.focus();
-submitBtn.click();
-return 'final-page-clicked-submit';
-                    """
-                )
-                last_submit_retry = now
-                if log_callback and (retried == "final-page-clicked-submit" or (isinstance(retried, str) and retried.startswith("final-page-no-submit"))):
-                    log_callback(f"[Debug] 最终页状态: {retried}")
-                if isinstance(retried, str) and retried.startswith("final-page-no-submit"):
-                    if retried != final_no_submit_state:
-                        final_no_submit_state = retried
-                        final_no_submit_since = now
-                    elif final_no_submit_since and now - final_no_submit_since >= final_no_submit_timeout:
-                         raise _AccountRetryNeeded(
-                            f"最终注册页状态 {final_no_submit_timeout}s 未变化且未找到提交按钮，重试当前账号: {retried}"
-                        )
-                else:
-                    final_no_submit_state = ""
-                    final_no_submit_since = None
-                if isinstance(retried, str) and retried.startswith("final-page-wait-cf"):
-                    token_len = retried.split(":", 1)[1] if ":" in retried else "0"
-                    if log_callback:
-                        log_callback(
-                            f"[Debug] 最终页状态: final-page-wait-cf, token长度={token_len}"
-                        )
-                    # 首次立即尝试，之后按 CF_RETRY_INTERVAL 复用
-                    if last_cf_retry_at <= 0 or (now - last_cf_retry_at >= CF_RETRY_INTERVAL):
-                        _try_sync_turnstile(
-                            log_callback=log_callback,
-                            cancel_callback=cancel_callback,
-                            reason="最终页 Cloudflare 卡住，自动二次复用 Turnstile",
-                        )
-                        last_cf_retry_at = time.time()
-
-            # 再读一次 cookie（点击提交后可能刚写入）
-            sso_val, names = _read_sso_from_cookies()
-            last_seen_names |= names
-            if sso_val:
-                if log_callback:
-                    log_callback("[*] 已获取到 sso cookie")
-                return sso_val
         except PageDisconnectedError:
-            if log_callback:
-                log_callback("[Debug] 页面断开，尝试刷新标签...")
             refresh_active_page()
         except Exception as exc:
-            name = type(exc).__name__
-            if name in ("AccountRetryNeeded", "RegistrationCancelled", "AccountAlreadyRegistered"):
+            if type(exc).__name__ in (
+                "AccountRetryNeeded",
+                "RegistrationCancelled",
+                "AccountAlreadyRegistered",
+            ):
                 raise
             if log_callback:
-                log_callback(f"[Debug] 等待 sso 时异常: {exc}")
-
+                log_callback(f"[Debug] 等待注册完成时异常: {exc}")
         sleep_with_cancel(0.4, cancel_callback)
 
-    final_url = _current_url()
-    raise Exception(
-        "sso_timeout：等待超时未获取到 sso cookie（多为登录链被打断或未真正建号）。"
-        f" url={final_url[:120]} cookies={sorted(last_seen_names)}"
-    )
-
-
-# 点过「允许」后再观察 done 页多久；超时即交由 token 轮询裁决
-DEVICE_ALLOW_OBSERVE_SECONDS = 6.0
-
-_DEVICE_ALLOW_KEYS = ("允许", "allow", "approve", "accept")
-_DEVICE_CONTINUE_KEYS = ("继续", "continue", "下一步", "next", "确认", "confirm")
-_DEVICE_DENY_KEYS = ("拒绝", "deny", "cancel", "取消")
-
-
-def _click_device_button_native(page_obj, keywords) -> str:
-    """用 Playwright 真实事件点击按钮，返回被点按钮文本；未点到返回 ''。
-
-    consent 页两个 submit 按钮都没有 name/value，是 React 的 onClick 负责在提交前
-    填充隐藏字段 action=allow。JS 合成 click 会直接触发原生 form submit，抢在
-    onClick 之前把 action="" 发出去，服务端返回 Invalid action、授权不落库。
-    只有真实事件（isTrusted）才能让 React 正常填值。
-    """
-    try:
-        elements = page_obj.eles("tag:button")
-    except Exception:
-        return ""
-    for ele in elements:
-        try:
-            text = str(ele.text or "").strip()
-        except Exception:
-            continue
-        if not text:
-            continue
-        low = text.replace(" ", "").lower()
-        if any(k in low for k in _DEVICE_DENY_KEYS):
-            continue
-        if not any(k in low for k in keywords):
-            continue
-        try:
-            ele.click()
-            return text
-        except Exception:
-            continue
-    return ""
-
-
-def authorize_device_in_browser(
-    user_code: str,
-    open_url: str,
-    timeout: int = 90,
-    log_callback=None,
-    cancel_callback=None,
-) -> bool:
-    """在注册浏览器会话中完成 Device 页「继续」→「允许」。
-
-    对齐 CPA 管理页截图：打开 /oauth2/device?user_code=... 后点继续/允许。
-    """
-    user_code = str(user_code or "").strip()
-    open_url = str(open_url or "").strip()
-    if not user_code or not open_url:
-        if log_callback:
-            log_callback("[!] 浏览器 Device 授权参数不完整")
-        return False
-    if not open_url.startswith("https://") or "x.ai" not in open_url:
-        if log_callback:
-            log_callback(f"[!] 不受信的 device URL: {open_url[:120]}")
-        return False
-
-    refresh_active_page()
-    page_obj = active_page()
-    if page_obj is None:
-        if log_callback:
-            log_callback("[!] 无活动浏览器，无法 Device 授权")
-        return False
-
-    if log_callback:
-        log_callback(f"[*] 浏览器打开 Device 授权页 user_code={user_code}")
-
-    # Device 授权页可能被 SSO 重定向到 grok.com 中断，重试几次
-    device_nav_ok = False
-    for nav_attempt in range(3):
-        try:
-            page_obj.get(open_url)
-            page_obj.wait.doc_loaded()
-            # 检查是否真的停在了 device 页
-            current_url = str(page_obj.url or "")
-            if "oauth2/device" in current_url:
-                device_nav_ok = True
-                break
-            if log_callback:
-                log_callback(f"[Debug] Device 页导航被重定向到: {current_url}，重试 {nav_attempt + 1}/3")
-            sleep_with_cancel(1, cancel_callback)
-        except Exception as exc:
-            if log_callback:
-                log_callback(f"[Debug] Device 页导航异常(第{nav_attempt + 1}次): {exc}")
-            sleep_with_cancel(1, cancel_callback)
-
-    if not device_nav_ok:
-        if log_callback:
-            log_callback("[!] 打开 Device 页失败：导航被重定向中断")
-        return False
-    sleep_with_cancel(0.6, cancel_callback)
-
-    deadline = time.time() + max(15, int(timeout or 90))
-    clicked_continue = False
-    clicked_allow = False
-    # 点过「允许」后只再观察这么久 done 页；成功与否最终由 token 轮询裁决
-    allow_observe_deadline = 0.0
-
-    while time.time() < deadline:
-        raise_if_cancelled(cancel_callback)
-        refresh_active_page()
-        page_obj = active_page()
-        if page_obj is None:
-            return False
-        try:
-            state = page_obj.run_js(
-                r"""
-const userCode = String(arguments[0] || '').trim();
-function isVisible(node) {
-  if (!node) return false;
-  const style = window.getComputedStyle(node);
-  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-  const rect = node.getBoundingClientRect();
-  return rect.width > 0 && rect.height > 0;
-}
-function buttonText(node) {
-  return [
-    node.innerText, node.textContent, node.getAttribute('value'),
-    node.getAttribute('aria-label'), node.getAttribute('title'),
-  ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
-}
-const url = String(location.href || '');
-const bodyText = String(document.body && document.body.innerText || '').slice(0, 4000);
-const lowBody = bodyText.toLowerCase();
-if (url.includes('/oauth2/device/done') ||
-    lowBody.includes('device authorized') ||
-    lowBody.includes('you have authorized') ||
-    bodyText.includes('设备已授权')) {
-  return {ok: true, stage: 'done', url};
-}
-if (url.includes('sign-in') || url.includes('sign-up')) {
-  return {ok: false, stage: 'need-login', url};
-}
-const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a')).filter(isVisible);
-function findBtn(preds) {
-  for (const node of buttons) {
-    const t = buttonText(node).replace(/\s+/g, '').toLowerCase();
-    for (const p of preds) {
-      if (t.includes(p)) return node;
-    }
-  }
-  return null;
-}
-// 若有 user_code 输入框则填入
-const inputs = Array.from(document.querySelectorAll('input')).filter(isVisible);
-for (const inp of inputs) {
-  const name = String(inp.getAttribute('name') || inp.getAttribute('id') || '').toLowerCase();
-  const ph = String(inp.getAttribute('placeholder') || '').toLowerCase();
-  if (name.includes('user') || name.includes('code') || ph.includes('code') || ph.includes('代码')) {
-    if (userCode && String(inp.value || '').replace(/\s+/g, '') !== userCode.replace(/\s+/g, '')) {
-      inp.focus();
-      inp.value = userCode;
-      inp.dispatchEvent(new Event('input', {bubbles: true}));
-      inp.dispatchEvent(new Event('change', {bubbles: true}));
-    }
-  }
-}
-// 只做状态检测，不在 JS 里点击：consent 页「允许」是 React 受控 submit，
-// 合成 click 会抢在 onClick 填 action 之前触发原生提交，服务端回 Invalid action。
-const allowBtn = findBtn(['允许', 'allow', 'approve', '授权', 'accept']);
-const continueBtn = findBtn(['继续', 'continue', '下一步', 'next', 'confirm', '确认']);
-return {
-  ok: false,
-  stage: allowBtn ? 'has-allow' : (continueBtn ? 'has-continue' : 'waiting'),
-  url,
-  text: buttonText(allowBtn || continueBtn || document.createElement('span')),
-  buttons: buttons.map(buttonText).filter(Boolean).slice(0, 6),
-};
-                """,
-                user_code,
-            )
-        except Exception as exc:
-            if log_callback:
-                log_callback(f"[Debug] Device 页脚本异常: {exc}")
-            sleep_with_cancel(0.8, cancel_callback)
-            continue
-
-        if not isinstance(state, dict):
-            sleep_with_cancel(0.6, cancel_callback)
-            continue
-        stage = str(state.get("stage") or "")
-        if state.get("ok") or stage == "done":
-            if log_callback:
-                log_callback("[*] 浏览器 Device 授权完成（done）")
-            return True
-        if stage == "need-login":
-            if clicked_allow:
-                break
-            if log_callback:
-                log_callback("[!] Device 页要求重新登录，SSO 可能无效")
-            return False
-        if stage == "has-allow" and not clicked_allow:
-            text = _click_device_button_native(page_obj, _DEVICE_ALLOW_KEYS)
-            if text:
-                if log_callback:
-                    log_callback(f"[*] 已点击「允许」(原生事件): {text}")
-                clicked_allow = True
-                allow_observe_deadline = time.time() + DEVICE_ALLOW_OBSERVE_SECONDS
-            sleep_with_cancel(1.0, cancel_callback)
-            continue
-        if clicked_allow and time.time() >= allow_observe_deadline:
-            # 已提交授权但页面无已知 done 文案，交给 token 轮询判定真实结果
-            break
-        if stage == "has-continue" and not clicked_allow:
-            text = _click_device_button_native(page_obj, _DEVICE_CONTINUE_KEYS)
-            if text and not clicked_continue:
-                clicked_continue = True
-                if log_callback:
-                    log_callback(f"[*] 已点击「继续」(原生事件): {text}")
-            sleep_with_cancel(1.0, cancel_callback)
-            continue
-        sleep_with_cancel(0.7, cancel_callback)
-
-    if clicked_allow:
-        if log_callback:
-            log_callback("[*] 已提交「允许」，未见 done 页；改由 token 轮询判定")
-        return True
-    if log_callback:
-        log_callback(
-            f"[!] 浏览器 Device 授权失败：未点到「允许」"
-            f"(continue={clicked_continue})"
-        )
-    return False
+    final_url = str(getattr(page, "url", "") or "")
+    raise Exception(f"registration_timeout：等待注册完成跳转超时。 url={final_url[:120]}")

@@ -3,15 +3,12 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import { Layout } from "@/components/Layout";
 import { DashboardPage } from "@/pages/Dashboard";
 import { AccountsPage } from "@/pages/Accounts";
-import { RegisterPage } from "@/pages/Register";
+import { XRegistrationPage } from "@/pages/XRegistration";
+import { XAccountRegistrationPage } from "@/pages/XAccountRegistration";
 import { SettingsPage } from "@/pages/Settings";
 import { api } from "@/lib/api";
 import { LoginPage } from "@/pages/Login";
-import { ReloginPage } from "@/pages/Relogin";
-import { ReloginHistoryPage } from "@/pages/ReloginHistory";
-import { CredentialsPage } from "@/pages/Credentials";
 import { ConfigFilePage } from "@/pages/ConfigFile";
-import { SsoCheckHistoryPage, SsoCheckPage } from "@/pages/SsoCheck";
 import { FlaggedExitIpsPage } from "@/pages/FlaggedExitIps";
 
 export default function App() {
@@ -30,8 +27,8 @@ export default function App() {
       setJobRunning(running);
       setJobPolling(running);
     };
-    window.addEventListener("grok-auth-required", onAuthRequired);
-    window.addEventListener("grok-job-state", onJobState);
+    window.addEventListener("x-register-auth-required", onAuthRequired);
+    window.addEventListener("x-register-job-state", onJobState);
     api.authMe()
       .then((data) => setAuth({
         enabled: !!data.enabled,
@@ -41,8 +38,8 @@ export default function App() {
       .catch(() => setAuth({ enabled: true, setup_required: false, authenticated: false }))
       .finally(() => setAuthLoading(false));
     return () => {
-      window.removeEventListener("grok-auth-required", onAuthRequired);
-      window.removeEventListener("grok-job-state", onJobState);
+      window.removeEventListener("x-register-auth-required", onAuthRequired);
+      window.removeEventListener("x-register-job-state", onJobState);
     };
   }, []);
 
@@ -52,9 +49,9 @@ export default function App() {
     let timer: number | undefined;
     const tick = async () => {
       try {
-        const data = await api.job();
+        const data = await api.jobs();
         if (!alive) return;
-        const running = !!data.job?.running;
+        const running = !!data.running;
         setJobRunning(running);
         if (running) timer = window.setTimeout(tick, 3000);
         else setJobPolling(false);
@@ -92,23 +89,15 @@ export default function App() {
         <Route index element={<Navigate to="/overview" replace />} />
         <Route path="overview" element={<DashboardPage />} />
         <Route path="accounts" element={<AccountsPage />} />
-        <Route path="accounts/sso-check" element={<SsoCheckPage />} />
-        <Route path="accounts/sso-check/history" element={<SsoCheckHistoryPage />} />
-        <Route path="accounts/sso-check/history/:runId" element={<SsoCheckHistoryPage />} />
         <Route path="accounts/exit-ips" element={<FlaggedExitIpsPage />} />
-        <Route path="accounts/relogin" element={<ReloginPage />} />
-        <Route path="accounts/relogin/history" element={<ReloginHistoryPage />} />
-        <Route path="accounts/relogin/history/:runId" element={<ReloginHistoryPage />} />
-        <Route path="accounts/credentials" element={<CredentialsPage />} />
-        <Route path="registration/new" element={<RegisterPage view="new" />} />
-        <Route path="registration/runtime" element={<RegisterPage view="runtime" />} />
-        <Route path="register" element={<Navigate to="/registration/new" replace />} />
+        <Route path="x-registration/new" element={<XRegistrationPage view="new" />} />
+        <Route path="x-registration/runtime" element={<XRegistrationPage view="runtime" />} />
+        <Route path="x-account-registration/new" element={<XAccountRegistrationPage view="new" />} />
+        <Route path="x-account-registration/runtime" element={<XAccountRegistrationPage view="runtime" />} />
+        <Route path="registration/new" element={<Navigate to="/x-registration/new" replace />} />
+        <Route path="registration/runtime" element={<Navigate to="/x-registration/runtime" replace />} />
+        <Route path="register" element={<Navigate to="/x-registration/new" replace />} />
         <Route path="settings/registration" element={<SettingsPage section="registration" />} />
-        {/* TokenAuth 已并入注册设置，保留旧地址并默认打开授权转换 Tab */}
-        <Route path="settings/tokenauth" element={<Navigate to="/settings/registration?tab=tokenauth" replace />} />
-        {/* 旧路由保留重定向，避免书签/外链 404 */}
-        <Route path="settings/cpa" element={<Navigate to="/settings/registration?tab=tokenauth" replace />} />
-        <Route path="settings/grok2api" element={<Navigate to="/settings/registration?tab=tokenauth" replace />} />
         <Route path="settings/mail" element={<SettingsPage section="mail" />} />
         <Route path="settings/outlook" element={<SettingsPage section="outlook" />} />
         <Route path="settings/config" element={<ConfigFilePage />} />

@@ -38,7 +38,7 @@ export function FlaggedExitIpsPage() {
     const keyword = query.trim().toLowerCase();
     if (!keyword) return items;
     return items.filter((item) =>
-      [item.ip, item.last_email, item.last_bot_flag_source, item.last_failure_reason]
+      [item.ip, item.last_email, item.last_risk_source, item.last_failure_reason]
         .join(" ")
         .toLowerCase()
         .includes(keyword)
@@ -123,7 +123,7 @@ export function FlaggedExitIpsPage() {
                         <Badge variant="warning">命中 {item.hit_count || 1}</Badge>
                       </td>
                       <td className="border-b border-slate-100 px-3 py-3 text-xs text-muted-foreground">
-                        {item.last_bot_flag_source || "—"}
+                        {item.last_risk_source || "—"}
                       </td>
                       <td className="border-b border-slate-100 px-3 py-3">
                         <div className="break-all text-sm">{item.last_email || "—"}</div>
@@ -160,8 +160,8 @@ export function FlaggedExitIpsPage() {
                       <div className="break-all font-mono text-sm font-medium text-foreground">{item.ip}</div>
                       <div className="mt-1.5 flex flex-wrap gap-1.5">
                         <Badge variant="warning">命中 {item.hit_count || 1}</Badge>
-                        {item.last_bot_flag_source ? (
-                          <Badge variant="secondary">botFlagSource={item.last_bot_flag_source}</Badge>
+                        {item.last_risk_source ? (
+                          <Badge variant="secondary">来源={item.last_risk_source}</Badge>
                         ) : null}
                       </div>
                     </div>

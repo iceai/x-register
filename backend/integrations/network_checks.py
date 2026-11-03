@@ -1,8 +1,5 @@
 # -*- coding: utf-8 -*-
-"""启动前依赖检查。
-
-集中验证代理出口、邮箱渠道和授权服务配置，返回适合控制台展示的结构化结果。
-"""
+"""代理、xAI 注册页与邮箱服务的启动前依赖检查。"""
 from __future__ import annotations
 
 import socket
@@ -12,11 +9,12 @@ from urllib.parse import urlparse
 
 from backend.mailbox import cloudflare_worker as cloudflare_provider
 from backend.integrations.proxy import redact_proxy_text, resolve_proxy_url
-from backend.shared.paths import resolve_project_path
 
 CheckResult = Tuple[str, bool, str]  # name, ok, detail
 XAI_SIGNUP_CHECK_NAME = "xAI注册页"
 XAI_SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
+X_SIGNUP_CHECK_NAME = "X.com注册页"
+X_SIGNUP_URL = "https://x.com/i/flow/signup"
 
 
 def _tcp_open(host: str, port: int, timeout: float = 2.0) -> bool:
@@ -143,6 +141,56 @@ def check_xai_signup(proxy_url: str, http_get: Callable) -> CheckResult:
 
 def has_blocking_xai_failure(results: List[CheckResult]) -> bool:
     return any(name == XAI_SIGNUP_CHECK_NAME and not ok for name, ok, _ in results)
+
+
+def check_x_signup(proxy_url: str, http_get: Callable) -> CheckResult:
+    """检查 X.com 官方注册页是否可通过当前注册代理访问。"""
+    proxy_url = str(proxy_url or "").strip()
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+    try:
+        response = http_get(
+            X_SIGNUP_URL,
+            headers={
+                "Accept": "text/html,application/xhtml+xml",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/138.0.0.0 Safari/537.36"
+                ),
+            },
+            timeout=15,
+            allow_redirects=True,
+            proxies=proxies,
+            impersonate="chrome",
+            _allow_direct_fallback=False,
+        )
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status in {401, 403, 429, 503}:
+            return X_SIGNUP_CHECK_NAME, False, f"访问受限 HTTP {status}"
+        if status <= 0 or status >= 400:
+            return X_SIGNUP_CHECK_NAME, False, f"HTTP {status or 'unknown'}"
+        return X_SIGNUP_CHECK_NAME, True, f"可达 HTTP {status}"
+    except Exception as exc:
+        return X_SIGNUP_CHECK_NAME, False, redact_proxy_text(exc)
+
+
+def run_x_account_connectivity_checks(
+    config: dict,
+    http_get: Callable,
+    http_post: Callable,
+) -> List[CheckResult]:
+    """检查 X.com 注册实际依赖的代理、注册页和邮箱服务。"""
+    proxy = resolve_proxy_url(config.get("proxy", ""))
+    return [
+        check_proxy(proxy, http_get),
+        check_x_signup(proxy, http_get),
+        check_email_api(
+            str(config.get("email_provider", "") or ""),
+            config,
+            http_get,
+            http_post,
+        ),
+    ]
 
 
 def check_email_api(provider: str, config: dict, http_get: Callable, http_post: Callable) -> CheckResult:
@@ -300,71 +348,6 @@ def check_email_api(provider: str, config: dict, http_get: Callable, http_post: 
         return "邮箱API", False, str(exc)
 
 
-def check_cpa(config: dict, http_get: Callable) -> CheckResult:
-    if not config.get("cpa_auto_add"):
-        return "CPA", True, "未开启 SSO→auth（跳过）"
-    auth_dir = str(config.get("cpa_auth_dir", "") or "").strip()
-    remote = str(config.get("cpa_remote_url", "") or "").strip()
-    key = str(config.get("cpa_management_key", "") or "").strip()
-    g2a_dir = str(config.get("grok2api_auth_dir", "") or "").strip()
-
-    # 配置中的相对目录统一以项目根目录为基准。
-    if auth_dir:
-        auth_dir = str(resolve_project_path(auth_dir))
-    if g2a_dir:
-        g2a_dir = str(resolve_project_path(g2a_dir))
-
-    if not auth_dir and not remote and not g2a_dir:
-        return "CPA", False, "已开启但未配置 CPA auth 目录 / 远程地址 / Grok2API 目录"
-    parts = []
-    import os
-    if auth_dir:
-        if os.path.isdir(auth_dir):
-            parts.append("CPA本地目录OK")
-        else:
-            # 自动创建目录
-            try:
-                os.makedirs(auth_dir, exist_ok=True)
-                parts.append("CPA本地目录已创建")
-            except Exception as exc:
-                return "CPA", False, f"CPA auth 目录不存在且无法创建: {auth_dir} ({exc})"
-    if g2a_dir:
-        if os.path.isdir(g2a_dir):
-            parts.append("Grok2API目录OK")
-        else:
-            try:
-                os.makedirs(g2a_dir, exist_ok=True)
-                parts.append("Grok2API目录已创建")
-            except Exception as exc:
-                return "CPA", False, f"Grok2API 目录不存在且无法创建: {g2a_dir} ({exc})"
-    if remote:
-        if not key:
-            return "CPA", False, "已配远程地址但缺少管理密钥"
-        try:
-            u = urlparse(remote)
-            host = u.hostname or "127.0.0.1"
-            port = u.port or (443 if u.scheme == "https" else 80)
-            if not _tcp_open(host, port):
-                return "CPA", False, f"远程不可达 {host}:{port}"
-            base = remote.rstrip("/")
-            # 管理 API 列表
-            resp = http_get(
-                f"{base}/v0/management/auth-files",
-                headers={"Authorization": f"Bearer {key}"},
-                timeout=8,
-                proxies={},  # CPA 一般本机
-                impersonate="chrome",
-            )
-            if resp.status_code in (401, 403):
-                return "CPA", False, f"管理密钥无效 HTTP {resp.status_code}"
-            if resp.status_code >= 500:
-                return "CPA", False, f"CPA 服务异常 HTTP {resp.status_code}"
-            parts.append(f"远程OK HTTP {resp.status_code}")
-        except Exception as exc:
-            return "CPA", False, f"远程探测失败: {exc}"
-    return "CPA", True, "；".join(parts) if parts else "OK"
-
-
 def run_connectivity_checks(config: dict, http_get: Callable, http_post: Callable) -> List[CheckResult]:
     results = []
     proxy = resolve_proxy_url(config.get("proxy", ""))
@@ -378,7 +361,6 @@ def run_connectivity_checks(config: dict, http_get: Callable, http_post: Callabl
             http_post,
         )
     )
-    results.append(check_cpa(config, http_get))
     return results
 
 

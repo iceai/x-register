@@ -138,7 +138,19 @@ const ElapsedTime = memo(function ElapsedTime({
 });
 
 
-export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
+export function RegisterPage({
+  view = "new",
+  platform = "xai",
+}: {
+  view?: "new" | "runtime";
+  platform?: "xai" | "x";
+}) {
+  const isXAccount = platform === "x";
+  const basePath = isXAccount ? "/x-account-registration" : "/x-registration";
+  const moduleTitle = isXAccount ? "X.com 账号注册" : "xAI / Grok 注册";
+  const moduleDescription = isXAccount
+    ? "通过 X.com 官方注册页创建账号；邮箱、验证码、重试和结果验证复用 xAI/Grok 注册逻辑。"
+    : "独立执行 xAI/Grok 账号注册，只保存邮箱和密码。";
   const [count, setCount] = useState("1");
   const [workers, setWorkers] = useState("1");
   const [job, setJob] = useState<JobStatus | null>(null);
@@ -207,7 +219,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
   };
 
   const emitJobState = (running: boolean) => {
-    window.dispatchEvent(new CustomEvent("grok-job-state", { detail: { running } }));
+    window.dispatchEvent(new CustomEvent("x-register-job-state", { detail: { running } }));
   };
 
   const refreshLogs = async (): Promise<JobStatus | null> => {
@@ -215,7 +227,9 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
     pollingRef.current = true;
     const viewVersion = logViewVersionRef.current;
     try {
-      const data = await api.logs(afterIdRef.current, 500);
+      const data = isXAccount
+        ? await api.xAccountLogs(afterIdRef.current, 500)
+        : await api.logs(afterIdRef.current, 500);
       setJob((current) => (sameJobStatus(current, data.job) ? current : data.job));
       if (viewVersion !== logViewVersionRef.current) return data.job;
       const freshLogs = (data.logs || []).filter((item) => item.id > afterIdRef.current);
@@ -241,10 +255,12 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
       .getConfig()
       .then((data) => {
         setCount(String(normalizeInteger(data.config.register_count || 1, 1, 1000)));
-        setWorkers(String(normalizeInteger(data.config.register_workers || 1, 1, 8)));
+        setWorkers(
+          isXAccount ? "1" : String(normalizeInteger(data.config.register_workers || 1, 1, 8))
+        );
       })
       .catch(() => undefined);
-  }, []);
+  }, [isXAccount]);
 
   useEffect(() => {
     if (!jobPolling) return;
@@ -268,7 +284,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
       cancelled = true;
       if (timer) window.clearTimeout(timer);
     };
-  }, [jobPolling]);
+  }, [jobPolling, isXAccount]);
 
   useEffect(() => {
     if (view !== "runtime" || !resultsExpanded) return;
@@ -280,8 +296,8 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
         const batchId = String(job?.batch_id || "").trim();
         const data = await api.accounts(
           batchId
-            ? { batchId, limit: 100, offset: 0 }
-            : { limit: 20, offset: 0 }
+            ? { batchId, platform, limit: 100, offset: 0 }
+            : { platform, limit: 20, offset: 0 }
         );
         if (cancelled) return;
         setRunResults(data.items || []);
@@ -300,7 +316,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
       cancelled = true;
       if (timer) window.clearInterval(timer);
     };
-  }, [view, resultsExpanded, job?.batch_id, job?.running]);
+  }, [view, resultsExpanded, job?.batch_id, job?.running, platform]);
 
   useEffect(() => {
     setRunResults([]);
@@ -395,10 +411,12 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
     setBusyAction("start");
     try {
       const normalizedCount = normalizeInteger(count, 1, 1000);
-      const normalizedWorkers = normalizeInteger(workers, 1, 8);
+      const normalizedWorkers = isXAccount ? 1 : normalizeInteger(workers, 1, 8);
       setCount(String(normalizedCount));
       setWorkers(String(normalizedWorkers));
-      const data = await api.startJob({ count: normalizedCount, workers: normalizedWorkers });
+      const data = isXAccount
+        ? await api.startXAccountJob(normalizedCount)
+        : await api.startJob({ count: normalizedCount, workers: normalizedWorkers });
       setJob(data.job);
       setJobPolling(!!data.job.running);
       emitJobState(!!data.job.running);
@@ -413,7 +431,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
   const onStop = async () => {
     setBusyAction("stop");
     try {
-      const data = await api.stopJob();
+      const data = isXAccount ? await api.stopXAccountJob() : await api.stopJob();
       setJob(data.job);
       setJobPolling(!!data.job.running);
       emitJobState(!!data.job.running);
@@ -428,7 +446,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
   const onCheck = async () => {
     setBusyAction("check");
     try {
-      const data = await api.connectivity();
+      const data = isXAccount ? await api.xAccountConnectivity() : await api.connectivity();
       setChecks(data.items || []);
       setChecksOpen(true);
       setOpsOpen(false);
@@ -445,9 +463,10 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
     setBusyAction("kill");
     try {
       const data = await api.killAllBrowsers();
-      setJob(data.job);
-      setJobPolling(!!data.job.running);
-      emitJobState(!!data.job.running);
+      const currentJob = isXAccount ? data.x_account_job : data.job;
+      setJob(currentJob);
+      setJobPolling(!!currentJob.running);
+      emitJobState(!!currentJob.running);
       setOpsOpen(false);
       showToast(`已终止 ${data.killed} 个进程，清理 ${data.profiles_cleaned} 个资料目录`, "success");
     } catch (err: any) {
@@ -491,14 +510,14 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
     return (
       <div className="space-y-5 sm:space-y-6">
         <PageHeader
-          title="新建注册任务"
-          description="设置本次任务规模，邮箱服务、代理和授权目标沿用系统配置。"
+          title={moduleTitle}
+          description={moduleDescription}
           actions={
             <>
               <Badge variant={job?.running ? "warning" : "success"}>{job?.running ? "已有任务运行" : "可以启动"}</Badge>
               {job?.running ? (
                 <Link
-                  to="/registration/runtime"
+                  to={`${basePath}/runtime`}
                   className="inline-flex min-h-9 items-center justify-center rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 hover:bg-slate-50"
                 >
                   打开运行监控
@@ -537,13 +556,15 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
                     type="number"
                     inputMode="numeric"
                     min={1}
-                    max={8}
+                    max={isXAccount ? 1 : 8}
                     value={workers}
-                    disabled={!!job?.running}
+                    disabled={!!job?.running || isXAccount}
                     onChange={(event) => setWorkers(event.target.value)}
-                    onBlur={() => setWorkers(String(normalizeInteger(workers, 1, 8)))}
+                    onBlur={() => setWorkers(String(normalizeInteger(workers, 1, isXAccount ? 1 : 8)))}
                   />
-                  <p className="text-xs text-slate-500">建议从 1–3 个并发开始。</p>
+                  <p className="text-xs text-slate-500">
+                    {isXAccount ? "X.com 流程固定单浏览器顺序执行。" : "建议从 1–3 个并发开始。"}
+                  </p>
                 </div>
               </div>
               <div className="grid gap-3 sm:grid-cols-3">
@@ -551,7 +572,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
                   [
                     ["邮箱服务", "沿用系统配置"],
                     ["网络代理", "按配置自动生效"],
-                    ["授权目标", "CPA / Grok2API"],
+                    ["输出内容", "邮箱 / 密码"],
                   ] as const
                 ).map(([label, value]) => (
                   <div key={label} className="rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-3">
@@ -645,15 +666,15 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
   return (
     <div className="space-y-5 sm:space-y-6">
       <PageHeader
-        title="运行监控"
-        description="查看任务进度、实时日志与结果摘要；次要操作收在抽屉和弹框，主页面专注盯进度与日志。"
+        title={`${moduleTitle} · 运行监控`}
+        description="查看任务进度、实时日志与结果摘要。"
         actions={
           <>
             <Badge variant={job?.running ? "warning" : job?.last_error ? "destructive" : "success"}>
               {job?.running ? "任务运行中" : job?.last_error ? "异常结束" : "空闲"}
             </Badge>
             <Link
-              to="/registration/new"
+              to={`${basePath}/new`}
               className={cn(buttonVariants({ variant: "outline", size: "sm" }), "inline-flex items-center gap-1.5")}
             >
               <Play className="h-3.5 w-3.5" />
@@ -1061,7 +1082,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
                     : "没有符合筛选条件的日志。"}
                 </div>
                 {!job?.running && logs.length === 0 ? (
-                  <Link to="/registration/new" className="text-sm text-sky-600 hover:text-sky-700">
+                  <Link to={`${basePath}/new`} className="text-sm text-sky-600 hover:text-sky-700">
                     去新建注册任务 →
                   </Link>
                 ) : null}
@@ -1188,7 +1209,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
 
               <div className="grid grid-cols-2 gap-2">
                 <Link
-                  to="/registration/new"
+                  to={`${basePath}/new`}
                   className={cn(buttonVariants({ variant: "secondary" }), "inline-flex justify-center")}
                   onClick={() => setOpsOpen(false)}
                 >
@@ -1297,7 +1318,6 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
                   {resultDetail.status || (resultDetail.success ? "success" : "failure")}
                 </Badge>
                 {resultDetail.provider ? <Badge variant="secondary">{resultDetail.provider}</Badge> : null}
-                {resultDetail.sso_saved ? <Badge variant="success">SSO 已保存</Badge> : null}
               </div>
               <dl className="grid gap-2 rounded-xl border border-slate-200 bg-slate-50/70 p-3 text-xs text-slate-600">
                 {(
@@ -1308,7 +1328,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
                     ["失败类型", resultDetail.failure_type || "—"],
                     ["失败原因", resultDetail.failure_reason || "—"],
                     ["批次", resultDetail.batch_id || job?.batch_id || "—"],
-                    ["CPA", resultDetail.cpa_status || "—"],
+                    ["账号文件", resultDetail.account_file || "—"],
                     ["Worker", resultDetail.worker_id ? String(resultDetail.worker_id) : "—"],
                   ] as const
                 ).map(([label, value]) => (

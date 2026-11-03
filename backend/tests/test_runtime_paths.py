@@ -18,8 +18,7 @@ class RuntimeLayoutTests(unittest.TestCase):
         )
         self.assertEqual(application.WEB_AUTH_FILE.resolve(), root / "data" / "web_auth.json")
         self.assertEqual(application.STATIC_DIR.resolve(), root / "front" / "dist")
-        self.assertEqual(gr.DEFAULT_CONFIG["cpa_auth_dir"], "data/cpa_auth")
-        self.assertEqual(gr.DEFAULT_CONFIG["grok2api_auth_dir"], "data/grok2api_auth")
+        self.assertFalse(any("auth_dir" in key for key in gr.DEFAULT_CONFIG))
 
 
 if __name__ == "__main__":

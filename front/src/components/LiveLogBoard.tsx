@@ -20,7 +20,7 @@ function detectLogTone(message: string): LogTone {
   }
   if (/(warn|warning|风险|注意|重试|retry)/i.test(message)) return "warn";
   if (/(success|成功|完成|imported|saved|已保存)/i.test(message)) return "success";
-  if (/(stage|step|开始|启动|waiting|proxy|browser|Turnstile|SSO)/i.test(message)) return "info";
+  if (/(stage|step|开始|启动|waiting|proxy|browser|Turnstile)/i.test(message)) return "info";
   return "default";
 }
 

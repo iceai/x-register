@@ -7,11 +7,11 @@ import { useLocation } from "react-router-dom";
 import { Badge, Button, buttonVariants } from "@/components/ui";
 import { api, type VersionInfo } from "@/lib/api";
 
-const DISMISSED_VERSION_KEY = "grok-register-dismissed-update-version";
+const DISMISSED_VERSION_KEY = "x-register-dismissed-update-version";
 const SNAPSHOT_POLL_MS = 5 * 60 * 1000;
 const PREVIEW_QUERY_KEY = "preview-update";
 const PREVIEW_LATEST_VERSION = "v9.9.9-preview";
-export const UPDATE_SNAPSHOT_EVENT = "grok-update-snapshot";
+export const UPDATE_SNAPSHOT_EVENT = "x-register-update-snapshot";
 
 function dismissedVersion() {
   try {
@@ -42,7 +42,7 @@ function previewVersion(currentVersion = "v1.0.0"): VersionInfo {
       "",
       "- 账号中心新增 **出口 IP 风控** 页面，可查看和删除风控名单",
       "- 账号详情显示该次注册的出口 IP",
-      "- Grok2API 自动导入支持分别选择 `grok_build` / `grok_web` / `grok_console`",
+      "- 新增独立 **XRegistration** 注册模块，只保存邮箱和密码",
       "",
       "完整说明见 [Release 页面](https://github.com/kaibush/grok-register/releases)。",
     ].join("\n"),

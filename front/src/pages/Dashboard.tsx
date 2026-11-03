@@ -10,6 +10,7 @@ import {
   Play,
   RefreshCw,
   ServerCog,
+  UserPlus,
   Users,
 } from "lucide-react";
 import { api, type JobStatus, type Stats } from "@/lib/api";
@@ -26,9 +27,10 @@ import {
 } from "@/components/ui";
 
 const shortcuts = [
-  { to: "/registration/new", label: "新建注册", hint: "设置数量与并发", icon: Play },
+  { to: "/x-registration/new", label: "xAI / Grok 注册", hint: "设置数量与并发", icon: Play },
+  { to: "/x-account-registration/new", label: "X.com 注册", hint: "创建 X 账号", icon: UserPlus },
   { to: "/accounts", label: "账号列表", hint: "筛选和管理结果", icon: Users },
-  { to: "/accounts/relogin", label: "重新登录", hint: "批量刷新授权", icon: RefreshCw },
+  { to: "/accounts/exit-ips", label: "出口 IP", hint: "查看风险出口记录", icon: ServerCog },
   { to: "/settings/config", label: "查看配置", hint: "核对实际配置文件", icon: FileJson2 },
 ];
 
@@ -40,6 +42,7 @@ function formatSuccessRate(success = 0, total = 0) {
 export function DashboardPage() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [job, setJob] = useState<JobStatus | null>(null);
+  const [xAccountJob, setXAccountJob] = useState<JobStatus | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -50,6 +53,7 @@ export function DashboardPage() {
       const data = await api.stats();
       setStats(data.stats);
       setJob(data.job);
+      setXAccountJob(data.x_account_job);
       setError("");
     } catch (reason: any) {
       setError(reason.message || "数据加载失败");
@@ -69,6 +73,10 @@ export function DashboardPage() {
     () => Math.max(1, ...(stats?.providers || []).map((item) => item.total || 0)),
     [stats?.providers]
   );
+  const activeIsXAccount = !!xAccountJob?.running;
+  const activeJob = activeIsXAccount ? xAccountJob : job;
+  const activeJobLabel = activeIsXAccount ? "X.com" : "xAI / Grok";
+  const activeJobPath = activeIsXAccount ? "/x-account-registration/runtime" : "/x-registration/runtime";
 
   return (
     <div className="space-y-5 sm:space-y-6">
@@ -81,9 +89,9 @@ export function DashboardPage() {
               <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} aria-hidden="true" />
               刷新数据
             </Button>
-            <Link to="/registration/new" className={buttonVariants()}>
+            <Link to="/x-account-registration/new" className={buttonVariants()}>
               <Play className="h-4 w-4" aria-hidden="true" />
-              新建注册
+              注册 X 账号
             </Link>
           </>
         }
@@ -97,7 +105,7 @@ export function DashboardPage() {
             { title: "成功账号", value: stats?.unique_success_emails ?? 0, hint: `成功记录 ${stats?.success ?? 0} 条`, icon: CheckCircle2, tone: "bg-emerald-50 text-emerald-600" },
             { title: "全部记录", value: stats?.total ?? 0, hint: `失败 ${stats?.failure ?? 0} · 跳过 ${stats?.skipped ?? 0}`, icon: Database, tone: "bg-sky-50 text-sky-600" },
             { title: "今日完成", value: stats?.today_success ?? 0, hint: `今日任务记录 ${stats?.today_total ?? 0}`, icon: Clock3, tone: "bg-slate-100 text-slate-600" },
-            { title: "CPA 入库", value: stats?.cpa_success ?? 0, hint: `失败 ${stats?.cpa_failed ?? 0} · 邮箱停用 ${stats?.email_disabled ?? 0}`, icon: ServerCog, tone: "bg-amber-50 text-amber-600" },
+            { title: "邮箱停用", value: stats?.email_disabled ?? 0, hint: `停用失败 ${stats?.email_disable_failed ?? 0}`, icon: ServerCog, tone: "bg-amber-50 text-amber-600" },
           ].map((item) => {
             const Icon = item.icon;
             return <div key={item.title} className="min-w-0 p-4 sm:p-5">
@@ -130,23 +138,26 @@ export function DashboardPage() {
               <CardTitle>当前注册任务</CardTitle>
               <CardDescription>任务进度与执行状态会自动更新。</CardDescription>
             </div>
-            <Badge variant={job?.running ? "warning" : "success"}>{job?.running ? "执行中" : "空闲"}</Badge>
+            <Badge variant={activeJob?.running ? "warning" : "success"}>
+              {activeJob?.running ? `${activeJobLabel} 执行中` : "空闲"}
+            </Badge>
           </CardHeader>
           <CardContent className="space-y-5 pt-5 sm:pt-5">
             <div className="grid grid-cols-3 divide-x divide-slate-200 rounded-xl border border-slate-200 bg-slate-50/60 py-4 text-center">
-              {[["目标账号", job?.target_count ?? 0], ["并发数", job?.workers ?? 1], ["日志行", job?.log_count ?? 0]].map(([label, value]) => (
+              {[["目标账号", activeJob?.target_count ?? 0], ["并发数", activeJob?.workers ?? 1], ["日志行", activeJob?.log_count ?? 0]].map(([label, value]) => (
                 <div key={label} className="px-2">
                   <div className="text-xl font-semibold tabular-nums text-slate-950 sm:text-2xl">{value}</div>
                   <div className="mt-1 text-xs text-slate-500">{label}</div>
                 </div>
               ))}
             </div>
-            <div className={`flex items-start gap-3 rounded-xl border px-4 py-3 text-sm leading-6 ${job?.last_error ? "border-red-200 bg-red-50 text-red-800" : "border-slate-200 bg-white text-slate-600"}`}>
-              <Activity className={`mt-1 h-4 w-4 shrink-0 ${job?.last_error ? "text-red-600" : "text-sky-600"}`} />
-              <span>{job?.last_error || (job?.running ? "任务正在执行，可在运行监控中查看实时日志与进度。" : "当前没有运行中的任务，可以创建注册任务或处理已有账号。")}</span>
+            <div className={`flex items-start gap-3 rounded-xl border px-4 py-3 text-sm leading-6 ${activeJob?.last_error ? "border-red-200 bg-red-50 text-red-800" : "border-slate-200 bg-white text-slate-600"}`}>
+              <Activity className={`mt-1 h-4 w-4 shrink-0 ${activeJob?.last_error ? "text-red-600" : "text-sky-600"}`} />
+              <span>{activeJob?.last_error || (activeJob?.running ? `${activeJobLabel} 注册任务正在执行，可在运行监控中查看实时日志与进度。` : "当前没有运行中的任务，可以创建注册任务或处理已有账号。")}</span>
             </div>
             <div className="flex flex-wrap gap-2">
-              <Link to={job?.running ? "/registration/runtime" : "/registration/new"} className={buttonVariants({ variant: "secondary" })}>{job?.running ? "打开运行监控" : "创建任务"}</Link>
+              <Link to={activeJob?.running ? activeJobPath : "/x-registration/new"} className={buttonVariants({ variant: "secondary" })}>{activeJob?.running ? "打开运行监控" : "创建 xAI/Grok 任务"}</Link>
+              {!activeJob?.running ? <Link to="/x-account-registration/new" className={buttonVariants({ variant: "outline" })}>创建 X.com 任务</Link> : null}
               <Link to="/accounts" className={buttonVariants({ variant: "outline" })}>查看账号</Link>
             </div>
           </CardContent>
@@ -175,7 +186,7 @@ export function DashboardPage() {
         <div className="mb-3 flex items-center justify-between">
           <div><h2 className="text-base font-semibold text-slate-950">常用功能</h2><p className="mt-1 text-sm text-slate-500">按工作流程快速进入独立功能页。</p></div>
         </div>
-        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
           {shortcuts.map((item) => {
             const Icon = item.icon;
             return <Link key={item.to} to={item.to} className="group flex items-center gap-3 rounded-xl border border-slate-200 bg-white p-4 transition hover:border-slate-300 hover:bg-slate-50">

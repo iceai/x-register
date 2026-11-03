@@ -1,15 +1,13 @@
 import {
-  Archive,
   FileJson2,
   LayoutDashboard,
   Mail,
   MonitorDot,
   PlaySquare,
-  RefreshCcw,
   ShieldAlert,
-  ShieldCheck,
   Settings2,
   SlidersHorizontal,
+  UserPlus,
   Users,
   type LucideIcon,
 } from "lucide-react";
@@ -28,10 +26,7 @@ export type NavigationGroup = {
 
 export const accountNavigationItems: readonly NavigationItem[] = [
   { to: "/accounts", label: "账号管理", shortLabel: "账号", icon: Users },
-  { to: "/accounts/sso-check", label: "SSO 风控检查", shortLabel: "风控", icon: ShieldCheck },
   { to: "/accounts/exit-ips", label: "出口 IP 风控", shortLabel: "出口IP", icon: ShieldAlert },
-  { to: "/accounts/relogin", label: "账号重新登录", shortLabel: "重登", icon: RefreshCcw },
-  { to: "/accounts/credentials", label: "授权文件管理", shortLabel: "授权", icon: Archive },
 ];
 
 export const navigationGroups: readonly NavigationGroup[] = [
@@ -40,10 +35,17 @@ export const navigationGroups: readonly NavigationGroup[] = [
     items: [{ to: "/overview", label: "概览", shortLabel: "概览", icon: LayoutDashboard }],
   },
   {
-    label: "注册中心",
+    label: "xAI / Grok 注册",
     items: [
-      { to: "/registration/new", label: "新建注册", shortLabel: "注册", icon: PlaySquare },
-      { to: "/registration/runtime", label: "运行监控", shortLabel: "监控", icon: MonitorDot },
+      { to: "/x-registration/new", label: "新建注册", shortLabel: "注册", icon: PlaySquare },
+      { to: "/x-registration/runtime", label: "运行监控", shortLabel: "监控", icon: MonitorDot },
+    ],
+  },
+  {
+    label: "X.com 注册",
+    items: [
+      { to: "/x-account-registration/new", label: "注册 X 账号", shortLabel: "X 注册", icon: UserPlus },
+      { to: "/x-account-registration/runtime", label: "运行监控", shortLabel: "X 监控", icon: MonitorDot },
     ],
   },
   {
@@ -65,6 +67,6 @@ export const navigationItems: readonly NavigationItem[] = navigationGroups.flatM
 
 export const mobilePrimaryItems: readonly NavigationItem[] = [
   navigationGroups[0].items[0],
-  navigationGroups[1].items[0],
   navigationGroups[2].items[0],
+  navigationGroups[3].items[0],
 ];

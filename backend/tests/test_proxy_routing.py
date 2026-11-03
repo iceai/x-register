@@ -5,7 +5,6 @@ import unittest
 from unittest import mock
 
 from backend.automation import session as browser_session
-from backend.integrations import auth_exchange
 from backend.integrations import network_checks
 from backend.registration import engine as gr
 
@@ -247,12 +246,12 @@ class ProxyRoutingTests(unittest.TestCase):
         self.assertTrue(ok, detail)
         self.assertEqual(direct_get.call_args.kwargs["proxies"], {})
 
-    def test_outlook_disable_is_forced_direct(self):
+    def test_outlook_disable_after_registration_is_forced_direct(self):
         gr.config.update(
             {
                 "email_provider": "outlookemail",
                 "outlookemail_source": "accounts",
-                "outlookemail_disable_after_cpa_success": True,
+                "outlookemail_disable_after_registration_success": True,
             }
         )
         with mock.patch.object(
@@ -264,81 +263,14 @@ class ProxyRoutingTests(unittest.TestCase):
             "disable_account",
             return_value={"success": True, "account_id": 1},
         ) as disable:
-            detail = gr.disable_outlookemail_after_cpa_success(
-                "fixture@outlook.com", {"status": "success"}
+            detail = gr.disable_outlookemail_after_registration_success(
+                "fixture@outlook.com"
             )
         self.assertEqual(detail["status"], "success")
         self.assertIs(lookup.call_args.args[0], gr.http_get)
         self.assertIs(disable.call_args.args[0], gr.http_get)
         self.assertIs(disable.call_args.args[1], gr.direct_http_session)
         self.assertEqual(disable.call_args.kwargs["proxies"], {})
-
-    def test_sso_token_exchange_uses_proxy_but_cpa_remote_upload_is_direct(self):
-        proxy = "http://proxy-user:p%40ss@127.0.0.1:7897"
-        gr.config.update(
-            {
-                "proxy": proxy,
-                "cpa_auto_add": True,
-                "cpa_token_mode": "device_protocol",
-                "cpa_auth_dir": "",
-                "cpa_remote_url": "http://cpa.internal:8317",
-                "cpa_management_key": "management-key",
-                "grok2api_auth_dir": "",
-                "grok2api_remote_url": "",
-                "grok2api_remote_username": "",
-                "grok2api_remote_password": "",
-            }
-        )
-        with mock.patch.object(
-            gr._s2cpa,
-            "sso_to_token",
-            return_value={"access_token": "access", "refresh_token": "refresh"},
-        ) as exchange, mock.patch.object(
-            gr._s2cpa,
-            "token_to_cpa_record",
-            return_value={"access_token": "access", "email": "fixture@example.com"},
-        ), mock.patch.object(
-            gr._s2cpa,
-            "decode_jwt_payload",
-            return_value={},
-        ), mock.patch.object(
-            gr._s2cpa,
-            "upload_cpa_auth_remote",
-            return_value="xai-fixture.json",
-        ) as upload:
-            logs = []
-            self.assertTrue(
-                gr.add_sso_to_cpa(
-                    "sso-value",
-                    email="fixture@example.com",
-                    log_callback=logs.append,
-                )
-            )
-
-        self.assertEqual(exchange.call_args.kwargs["proxy"], proxy)
-        self.assertEqual(upload.call_args.kwargs["proxy"], "")
-        rendered_logs = "\n".join(logs)
-        self.assertNotIn("proxy-user", rendered_logs)
-        self.assertNotIn("p%40ss", rendered_logs)
-        self.assertIn("proxy=http://***:***@127.0.0.1:7897", rendered_logs)
-
-    def test_cpa_remote_http_session_does_not_inherit_environment_proxy(self):
-        response = mock.Mock(status_code=200, reason="OK", text="")
-        session = mock.MagicMock()
-        session.__enter__.return_value = session
-        session.__exit__.return_value = False
-        session.post.return_value = response
-        with mock.patch.object(auth_exchange.requests, "Session", return_value=session) as factory:
-            name = auth_exchange.upload_cpa_auth_remote(
-                "http://cpa.internal:8317",
-                "management-key",
-                {"email": "fixture@example.com"},
-                proxy="",
-            )
-        self.assertEqual(name, "xai-fixture@example.com.json")
-        factory.assert_called_once_with(trust_env=False)
-        self.assertIsNone(session.post.call_args.kwargs["proxies"])
-
 
 if __name__ == "__main__":
     unittest.main()

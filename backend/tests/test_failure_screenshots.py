@@ -97,21 +97,6 @@ class FailureScreenshotTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 application._failure_screenshot_file({"screenshot_path": str(outside)})
 
-    def test_timestamped_relogin_screenshot_reader_is_immutable_and_scoped(self):
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(application, "DATA_DIR", Path(tmp)):
-            root = Path(tmp) / "screenshots" / "relogin-failures"
-            root.mkdir(parents=True)
-            filename = "relogin-42-fixture@example.com-20260807_073500_123456.png"
-            image = root / filename
-            image.write_bytes(b"fixture-png")
-            resolved, media_type = application._relogin_screenshot_file(42, filename)
-            self.assertEqual(resolved, image.resolve())
-            self.assertEqual(media_type, "image/png")
-            with self.assertRaises(FileNotFoundError):
-                application._relogin_screenshot_file(41, filename)
-            with self.assertRaises(FileNotFoundError):
-                application._relogin_screenshot_file(42, "../outside.png")
-
     def test_screenshot_is_collected_and_deleted_with_account_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

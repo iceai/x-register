@@ -1,27 +1,19 @@
 # -*- coding: utf-8 -*-
 """注册产物定位与清理。
 
-根据数据库记录收集关联授权文件，并限制删除范围以保护数据库及公共清单文件。
+根据数据库记录收集账号文件和失败截图，并限制删除范围以保护数据库及公共清单文件。
 """
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Set, Tuple
 
 
-_PATH_IN_TEXT_RE = re.compile(
-    r"(?P<path>(?:[A-Za-z]:[\\/]|\\|/)[^\r\n\t\"']+\.(?:json|txt|png|jpe?g|webp))",
-    re.IGNORECASE,
-)
 _PROTECTED_BASENAMES = {
     "registration_results.sqlite3",
     "registration_results.sqlite3-wal",
     "registration_results.sqlite3-shm",
-    "mail_credentials.txt",
-    "sso_pending.txt",
-    "sso_risk_rejected.txt",
 }
 
 
@@ -33,34 +25,6 @@ def _safe_email_name(email: str) -> str:
     return _normalize_email(email).replace("/", "_").replace("\\", "_")
 
 
-def _extract_paths_from_text(text: Any) -> List[str]:
-    """从 auth_info / 自由文本中提取疑似本地文件路径。"""
-    found: List[str] = []
-    seen: Set[str] = set()
-    for raw_line in str(text or "").splitlines():
-        line = raw_line.strip().strip("\"'")
-        if not line:
-            continue
-        candidates: List[str] = []
-        if ": " in line:
-            candidates.append(line.split(": ", 1)[1].strip().strip("\"'"))
-        candidates.append(line)
-        for match in _PATH_IN_TEXT_RE.finditer(line):
-            candidates.append(match.group("path").strip().strip("\"'"))
-        for candidate in candidates:
-            value = str(candidate or "").strip().strip("\"'")
-            if not value:
-                continue
-            lower = value.lower()
-            if not lower.endswith((".json", ".txt", ".png", ".jpg", ".jpeg", ".webp")):
-                continue
-            if value in seen:
-                continue
-            seen.add(value)
-            found.append(value)
-    return found
-
-
 def collect_related_file_paths(
     record: Dict[str, Any],
     *,
@@ -69,26 +33,17 @@ def collect_related_file_paths(
 ) -> List[str]:
     """收集注册记录关联的本地真实文件路径（去重，仅已存在文件）。"""
     accounts_root = os.path.abspath(accounts_dir)
-    # app_dir 传入 data/ 目录时，授权目录直接位于其下；兼容旧调用的项目根目录。
-    root = os.path.abspath(app_dir) if app_dir else os.path.dirname(accounts_root)
+    del app_dir  # 保留参数兼容既有调用。
     email = _normalize_email(record.get("email"))
     safe_email = _safe_email_name(email)
 
     candidates: List[str] = []
-    for key in ("account_file", "auth_path", "screenshot_path"):
+    for key in ("account_file", "screenshot_path"):
         value = str(record.get(key) or "").strip()
         if value:
             candidates.append(value)
-    candidates.extend(_extract_paths_from_text(record.get("auth_info")))
-
     if safe_email:
-        candidates.extend(
-            [
-                os.path.join(accounts_root, f"{safe_email}.txt"),
-                os.path.join(root, "cpa_auth", f"xai-{safe_email}.json"),
-                os.path.join(root, "grok2api_auth", f"g2a-{safe_email}.json"),
-            ]
-        )
+        candidates.append(os.path.join(accounts_root, f"{safe_email}.txt"))
 
     resolved: List[str] = []
     seen: Set[str] = set()
@@ -170,12 +125,6 @@ def cleanup_side_files_for_emails(accounts_dir: str, emails: Iterable[str]) -> D
     result: Dict[str, int] = {}
     if not email_list or not os.path.isdir(root):
         return result
-
-    for name in ("sso_pending.txt", "sso_risk_rejected.txt", "mail_credentials.txt"):
-        path = os.path.join(root, name)
-        removed = remove_email_lines_from_file(path, email_list)
-        if removed:
-            result[path] = removed
 
     try:
         batch_files = sorted(Path(root).glob("accounts_*.txt"))

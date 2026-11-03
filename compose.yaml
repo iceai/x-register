@@ -1,10 +1,10 @@
 services:
-  grok-register:
-    image: ${GROK_REGISTER_IMAGE:-grok-register:local}
+  x-register:
+    image: ${X_REGISTER_IMAGE:-x-register:local}
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: grok-register
+    container_name: x-register
     init: true
     restart: unless-stopped
     ports:

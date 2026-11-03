@@ -32,11 +32,11 @@ function Brand() {
   return (
     <div className="flex min-w-0 items-center gap-3">
       <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-900 text-xs font-bold tracking-wide text-white">
-        GR
+        XR
       </div>
       <div className="min-w-0">
-        <div className="truncate text-sm font-semibold tracking-tight text-slate-950">Grok Register</div>
-        <div className="truncate text-[11px] text-slate-500">账号与授权控制台</div>
+        <div className="truncate text-sm font-semibold tracking-tight text-slate-950">X Register</div>
+        <div className="truncate text-[11px] text-slate-500">账号注册管理系统</div>
       </div>
     </div>
   );
@@ -255,7 +255,7 @@ export function Layout({ jobRunning, onLogout }: { jobRunning?: boolean; onLogou
             </div>
             <div className="min-w-0 lg:hidden">
               <div className="truncate text-sm font-semibold text-slate-950">{current?.label || "工作台"}</div>
-              <div className="truncate text-[11px] text-slate-500">Grok Register</div>
+              <div className="truncate text-[11px] text-slate-500">X Register</div>
             </div>
           </div>
           <div className="flex items-center gap-2">

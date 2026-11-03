@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """账号注册编排引擎。
 
-组合邮箱渠道、浏览器流程、授权交换、结果持久化与任务取消机制，提供 Web 后台
+组合邮箱渠道、浏览器流程、结果持久化与任务取消机制，提供 Web 后台
 调用的批量注册入口。
 """
 
@@ -12,25 +12,16 @@ import time
 import os
 import gc
 import secrets
-import struct
 import random
 import re
-import string
 import json
-import base64
 import traceback
 from urllib.parse import urlsplit
 
 from playwright._impl._errors import TargetClosedError as PageDisconnectedError
 from curl_cffi import requests
 
-# 授权交换和导出逻辑集中在 integrations 包，编排层只负责调用。
-from backend.integrations import auth_exchange as _s2cpa
 from backend.integrations import exit_ip as _exit_ip
-from backend.integrations import grokiq as _grokiq
-from backend.integrations import grok2api_client as _grok2api
-from backend.integrations import sub2api_client as _sub2api
-from backend.integrations import sso_checker as _sso_checker
 from backend.mailbox import cloudflare_worker as cloudflare_provider
 from backend.mailbox import cloud_mail as cloudmail_provider
 from backend.mailbox import duck_mail as duckmail_provider
@@ -65,7 +56,6 @@ from backend.automation.session import (
 )
 from backend.registration.signup_flow import (
     SIGNUP_URL,
-    authorize_device_in_browser,
     click_email_signup_button,
     open_signup_page,
     has_profile_form,
@@ -76,7 +66,7 @@ from backend.registration.signup_flow import (
     getTurnstileToken,
     build_profile,
     fill_profile_and_submit,
-    wait_for_sso_cookie,
+    wait_for_registration_completion,
 )
 
 
@@ -129,12 +119,6 @@ def account_file_for_email(email):
     return os.path.join(ACCOUNTS_DIR, f"{safe_email}.txt")
 
 
-def accounts_side_file(name):
-    """data/accounts/ 下的附属文件路径（mail_credentials / sso_pending 等）。"""
-    ensure_accounts_dir()
-    return os.path.join(ACCOUNTS_DIR, name)
-
-
 def get_registration_repository():
     """懒加载 SQLite；首次启动时把旧账号 TXT 补录为成功结果。"""
     global _repository
@@ -148,127 +132,11 @@ def get_registration_repository():
     return _repository
 
 
-def backfill_access_token_bot_risk(log_callback=None) -> int:
-    """从已有 CPA / Grok2API 授权文件回填 access_token 的 bfs 风控标记。"""
-    try:
-        repo = get_registration_repository()
-    except Exception as exc:
-        if log_callback:
-            log_callback(f"[!] bot_risk 回填初始化失败: {exc}")
-        return 0
-
-    auth_dirs = []
-    for key in ("cpa_auth_dir", "grok2api_auth_dir"):
-        raw = str(config.get(key, "") or "").strip()
-        if not raw:
-            continue
-        path = raw if os.path.isabs(raw) else os.path.join(APP_DIR, raw)
-        if os.path.isdir(path):
-            auth_dirs.append(path)
-    if not auth_dirs:
-        return 0
-
-    updated = 0
-    seen_emails = set()
-    for auth_dir in auth_dirs:
-        try:
-            names = os.listdir(auth_dir)
-        except OSError:
-            continue
-        for name in names:
-            if not name.endswith(".json"):
-                continue
-            file_path = os.path.join(auth_dir, name)
-            try:
-                with open(file_path, "r", encoding="utf-8") as handle:
-                    payload = json.load(handle)
-            except Exception:
-                continue
-            candidates = []
-            if isinstance(payload, dict):
-                if payload.get("access_token"):
-                    candidates.append(payload)
-                accounts = payload.get("accounts")
-                if isinstance(accounts, list):
-                    candidates.extend(item for item in accounts if isinstance(item, dict))
-            for item in candidates:
-                token = str(item.get("access_token") or "").strip()
-                if not token:
-                    continue
-                email = str(item.get("email") or "").strip().lower()
-                if not email:
-                    email = str(
-                        _s2cpa.decode_jwt_payload(token).get("email")
-                        or _s2cpa.decode_jwt_payload(token).get("sub")
-                        or ""
-                    ).strip().lower()
-                if not email or "@" not in email or email in seen_emails:
-                    continue
-                seen_emails.add(email)
-                bfs = _s2cpa.access_token_bfs(token)
-                bot_risk = _s2cpa.access_token_bot_risk(token)
-                if not bot_risk and bfs is None:
-                    continue
-                try:
-                    count = repo.update_bot_risk_by_email(
-                        email, bot_risk=bot_risk, bfs=bfs if bfs is not None else ""
-                    )
-                except Exception:
-                    continue
-                if count:
-                    updated += count
-    if updated and log_callback:
-        log_callback(f"[*] 已从授权文件回填 bot_risk 标记 {updated} 条")
-    return updated
-
-
-def backfill_registration_risk_bot_risk(log_callback=None) -> int:
-    """回填历史注册风控拒绝记录的 bot_risk 标记。
-
-    这类账号没有 access_token（OAuth 被跳过），回填不到 bfs，只能按
-    failure_type + failure_reason 认定。
-    """
-    try:
-        repo = get_registration_repository()
-    except Exception as exc:
-        if log_callback:
-            log_callback(f"[!] 注册风控 bot_risk 回填初始化失败: {exc}")
-        return 0
-    try:
-        updated = repo.backfill_registration_risk_bot_risk()
-    except Exception as exc:
-        if log_callback:
-            log_callback(f"[!] 注册风控 bot_risk 回填失败: {exc}")
-        return 0
-    if updated and log_callback:
-        log_callback(f"[*] 已回填或修正注册风控记录 {updated} 条")
-    return updated
-
-
-def backfill_grokiq_degraded_bot_risk(log_callback=None) -> int:
-    """把已回传的 GrokIQ 降智结果回填成风控标记。"""
-    try:
-        repo = get_registration_repository()
-    except Exception as exc:
-        if log_callback:
-            log_callback(f"[!] GrokIQ 降智风控回填初始化失败: {exc}")
-        return 0
-    try:
-        updated = repo.backfill_grokiq_degraded_bot_risk()
-    except Exception as exc:
-        if log_callback:
-            log_callback(f"[!] GrokIQ 降智风控回填失败: {exc}")
-        return 0
-    if updated and log_callback:
-        log_callback(f"[*] 已将 {updated} 条 GrokIQ 降智记录标记为风控")
-    return updated
-
-
 def email_registered_successfully(email):
     """数据库或旧账号文件中已有成功/已消耗记录时返回 True。
 
-    除正式 success 外，已保存 SSO、已判定 already_registered / registration_risk /
-    sso_timeout，或已尝试停用的 Outlook 邮箱也应跳过，避免邮箱池重复取用造成死循环。
+    除正式 success 外，已判定 already_registered 或已尝试停用的 Outlook
+    邮箱也应跳过，避免邮箱池重复取用造成死循环。
     """
     normalized = str(email or "").strip()
     if not normalized:
@@ -282,20 +150,6 @@ def email_registered_successfully(email):
     except Exception:
         pass
     return os.path.isfile(account_file_for_email(normalized))
-
-
-def _environment_int(name, default):
-    try:
-        return int(os.environ.get(name, str(default)) or default)
-    except (TypeError, ValueError):
-        return int(default)
-
-
-def _environment_bool(name, default=False):
-    raw = os.environ.get(name)
-    if raw is None:
-        return bool(default)
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 DEFAULT_CONFIG = {
@@ -325,9 +179,8 @@ DEFAULT_CONFIG = {
     "outlookemail_folder": "all",
     "outlookemail_top": 10,
     "outlookemail_pick_mode": "random",
-    "outlookemail_disable_after_cpa_success": False,
+    "outlookemail_disable_after_registration_success": False,
     "proxy": "http://127.0.0.1:7890",
-    "enable_nsfw": True,
     "debug_mode": False,
     "browser_engine": _bs.normalize_browser_engine(
         os.environ.get("GROK_BROWSER_ENGINE", "camoufox")
@@ -341,48 +194,6 @@ DEFAULT_CONFIG = {
     "register_count": 1,
     "register_workers": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-    # CLIProxyAPI(CPA) 直出：注册拿到 SSO 后换 token，写入 CPA / Grok2API
-    "cpa_auto_add": True,
-    # 获取 SSO 后使用完整账号页解析器复查会话、邮箱与 botFlag 风控字段。
-    "sso_detailed_risk_check": False,
-    # 注册完成后复查 grok.com botFlag；上游不再稳定提供该字段，默认跳过耗时复查。
-    "cpa_registration_risk_check": False,
-    # Token 换取方式：device_protocol（协议 Device Flow，默认）/ device_browser（浏览器 Device Flow）/ auth_code
-    "cpa_token_mode": "device_protocol",
-    # CPA 本地 auth 目录
-    "cpa_auth_dir": "data/cpa_auth",
-    # 远程 CPA：通过 Management API POST /v0/management/auth-files 上传
-    "cpa_remote_url": "",
-    "cpa_management_key": "",
-    # Grok2API grok_build 导入目录
-    "grok2api_auth_dir": "data/grok2api_auth",
-    # 远程 Grok2API 管理端：登录后通过 SSE 导入 grok_build JSON
-    "grok2api_remote_url": "",
-    "grok2api_remote_username": "",
-    "grok2api_remote_password": "",
-    "grok2api_auto_import": True,
-    "grok2api_auto_import_build": True,
-    "grok2api_auto_import_web": False,
-    "grok2api_auto_import_console": False,
-    # CPA 远程上传开关（独立于 cpa_auto_add；后者控制整个 SSO→auth 链路）
-    "cpa_upload_enabled": True,
-    # Sub2API：注册拿到 SSO 后直接上传 sso-to-oauth
-    "sub2api_enabled": False,
-    "sub2api_remote_url": "",
-    "sub2api_api_key": "",
-    "sub2api_group_ids": "",  # 逗号分隔字符串，如 "1,2"
-    "sub2api_proxy_id": 0,
-    "sub2api_concurrency": 1,
-    "sub2api_priority": 0,
-    "sub2api_name_prefix": "",
-    "grokiq_webhook_enabled": _environment_bool(
-        "GROKIQ_WEBHOOK_ENABLED", False
-    ),
-    "grokiq_webhook_url": os.environ.get("GROKIQ_WEBHOOK_URL", ""),
-    "grokiq_webhook_token": os.environ.get("GROKIQ_WEBHOOK_TOKEN", ""),
-    "grokiq_webhook_timeout_seconds": _environment_int(
-        "GROKIQ_WEBHOOK_TIMEOUT_SECONDS", 10
-    ),
     "mailnest_api_key": "",
     "mailnest_project_code": "x-ai001",
     # YYDS：留空自动选已验证域名；填写则固定该域名
@@ -420,30 +231,20 @@ class EmailDomainRejected(Exception):
         super().__init__(detail)
 
 
-class RegistrationRiskDenied(Exception):
-    """账号已创建，但服务端将本次注册裁决为 OAuth 不可用。
-
-    携带 botFlagSource：它与 access_token 里的 bfs 声明是同一个字段，
-    只是一个来自注册后的账号状态页、一个来自换到的 token。所以注册风控
-    拒绝的账号要和 bfs 非 0 一样标记 bot_risk，前端才会显示盾牌图标。
-    """
-
-    def __init__(
-        self,
-        message,
-        *,
-        bot_risk=False,
-        bot_flag_source=None,
-        bot_flag_details="",
-        risk_state=None,
-    ):
-        super().__init__(message)
-        # bot_risk 由抛出点显式给出；当前服务端规则仅以
-        # botFlagSource 非 0 为异常，"sso 为空"等前置失败不标记。
-        self.bot_risk = bool(bot_risk)
-        self.bot_flag_source = bot_flag_source
-        self.bot_flag_details = str(bot_flag_details or "")
-        self.risk_state = dict(risk_state or {})
+FAIL_CODE = "verification_code"
+FAIL_DOMAIN = "email_domain"
+FAIL_ALREADY_REGISTERED = "already_registered"
+FAIL_BROWSER = "browser"
+FAIL_STUCK = "flow_stuck"
+FAIL_OTHER = "other"
+FAIL_LABELS = {
+    FAIL_CODE: "验证码失败",
+    FAIL_DOMAIN: "邮箱域名拒绝",
+    FAIL_ALREADY_REGISTERED: "账号已存在",
+    FAIL_BROWSER: "浏览器异常",
+    FAIL_STUCK: "注册流程卡住",
+    FAIL_OTHER: "其他失败",
+}
 
 
 def prepare_registration_exit_ip(log_callback=None) -> str:
@@ -456,121 +257,17 @@ def prepare_registration_exit_ip(log_callback=None) -> str:
     )
 
 
-def remember_registration_risk_exit_ip(exc, email="", log_callback=None) -> bool:
-    """注册风控时再测一次浏览器出口 IP 再入库。
-
-    动态代理池可能在打开注册页后换出口，不能直接用注册前缓存的 IP。
-    """
-    if not getattr(exc, "bot_risk", False):
-        return False
-    started_ip = _exit_ip.current_start_exit_ip() or _exit_ip.current_exit_ip()
-    ip = _exit_ip.refresh_browser_exit_ip(
-        log_callback=log_callback,
-        reason="注册风控时",
-    ) or started_ip
-    if not ip:
-        if log_callback:
-            log_callback("[出口IP] 注册风控，但本次未识别到浏览器出口 IP，无法记录")
-        return False
-    try:
-        saved = get_registration_repository().remember_flagged_exit_ip(
-            ip,
-            email=email,
-            bot_flag_source=getattr(exc, "bot_flag_source", None),
-            failure_reason=str(exc),
-        )
-    except Exception as store_exc:
-        if log_callback:
-            log_callback(f"[出口IP] 记录风控出口 IP {ip} 失败: {store_exc}")
-        return False
-    if saved and log_callback:
-        if started_ip and started_ip != ip:
-            log_callback(
-                f"[出口IP] 注册风控，已记录出口 IP {ip}（打开注册页时是 {started_ip}）"
-            )
-        else:
-            log_callback(f"[出口IP] 注册风控，已记录出口 IP {ip}")
-    return bool(saved)
-
-
-def mark_registration_risk(cpa_detail, exc, *, email="", log_callback=None) -> None:
-    if isinstance(cpa_detail, dict):
-        cpa_detail.update(status="rejected", error=str(exc))
-    if apply_risk_bot_flag(cpa_detail, exc) and log_callback:
-        log_callback(
-            "[!] 注册风控标记 bot_risk"
-            f" botFlagSource={getattr(exc, 'bot_flag_source', None)!r}"
-        )
-    remember_registration_risk_exit_ip(exc, email=email, log_callback=log_callback)
-
-
-def apply_risk_bot_flag(cpa_detail: dict, exc) -> bool:
-    """把注册风控拒绝的 botFlagSource 落到 cpa_detail 的 bot_risk / bfs 上。
-
-    persist_registration_result 只从 cpa_detail 读这两个字段，不写就会存成
-    bot_risk=0，前端把被风控的账号显示成普通邮件图标。
-    """
-    if not isinstance(cpa_detail, dict):
-        return False
-    if not getattr(exc, "bot_risk", False):
-        return False
-    source = getattr(exc, "bot_flag_source", None)
-    cpa_detail["bot_risk"] = True
-    cpa_detail["bfs"] = "" if source is None else source
-    risk_state = getattr(exc, "risk_state", None)
-    if isinstance(risk_state, dict) and risk_state:
-        cpa_detail["sso_risk_check"] = dict(risk_state)
-    return True
-
-
-
-FAIL_DOMAIN = "domain_rejected"
-FAIL_ALREADY_REGISTERED = "already_registered"
-FAIL_RISK = "registration_risk"
-FAIL_CODE = "code_timeout"
-FAIL_BROWSER = "browser"
-FAIL_CPA = "cpa"
-FAIL_STUCK = "stuck_retry"
-FAIL_SSO = "sso_timeout"
-FAIL_INVALID_CREDENTIALS = "invalid_credentials"
-FAIL_OTHER = "other"
-
-FAIL_LABELS = {
-    FAIL_DOMAIN: "域名拒绝",
-    FAIL_ALREADY_REGISTERED: "账号已注册",
-    FAIL_RISK: "注册风控",
-    FAIL_CODE: "验证码超时",
-    FAIL_BROWSER: "浏览器断开",
-    FAIL_CPA: "CPA失败",
-    FAIL_STUCK: "流程卡住",
-    FAIL_SSO: "SSO超时",
-    FAIL_INVALID_CREDENTIALS: "账号密码错误",
-    FAIL_OTHER: "其它",
-}
-
-
 def classify_failure(exc) -> str:
-    from backend.registration.login_flow import (
-        InvalidLoginCredentials,
-        looks_like_invalid_credentials,
-    )
-
     if isinstance(exc, EmailDomainRejected):
         return FAIL_DOMAIN
     if isinstance(exc, _rf.AccountAlreadyRegistered):
         return FAIL_ALREADY_REGISTERED
-    if isinstance(exc, RegistrationRiskDenied):
-        return FAIL_RISK
-    if isinstance(exc, InvalidLoginCredentials):
-        return FAIL_INVALID_CREDENTIALS
     msg = str(exc or "")
     low = msg.lower()
-    if looks_like_invalid_credentials(msg) or "账号或密码错误" in msg:
-        return FAIL_INVALID_CREDENTIALS
     if isinstance(exc, AccountRetryNeeded) or "达到最大重试" in msg or "流程卡住" in msg:
         return FAIL_STUCK
-    if "sso_timeout" in low or "未获取到 sso" in msg or "未获取到 sso cookie" in msg:
-        return FAIL_SSO
+    if "registration_timeout" in low or "等待注册完成" in msg:
+        return FAIL_STUCK
     if "未收到验证码" in msg or "验证码阶段失败" in msg or "验证码" in msg and "失败" in msg:
         return FAIL_CODE
     if (
@@ -581,8 +278,6 @@ def classify_failure(exc) -> str:
         or "disconnected" in low
     ):
         return FAIL_BROWSER
-    if "[CPA]" in msg or "CPA" in msg and ("失败" in msg or "跳过" in msg):
-        return FAIL_CPA
     return FAIL_OTHER
 
 
@@ -590,8 +285,14 @@ def empty_fail_stats():
     return {k: 0 for k in FAIL_LABELS}
 
 
-def format_fail_stats(stats: dict) -> str:
-    parts = [f"{FAIL_LABELS.get(k, k)}={stats.get(k, 0)}" for k in FAIL_LABELS if stats.get(k, 0)]
+def format_fail_stats(stats: dict, labels=None) -> str:
+    active_labels = dict(FAIL_LABELS)
+    active_labels.update(dict(labels or {}))
+    parts = [
+        f"{active_labels.get(k, k)}={stats.get(k, 0)}"
+        for k in active_labels
+        if stats.get(k, 0)
+    ]
     if not parts:
         return "无分类失败"
     return " | ".join(parts)
@@ -672,28 +373,10 @@ def is_outlookemail_registration(provider="") -> bool:
     return value == "outlookemail"
 
 
-def cpa_conversion_succeeded(cpa_detail=None) -> bool:
-    return dict(cpa_detail or {}).get("status") == "success"
-
-
-def registration_counts_as_success(cpa_detail=None) -> bool:
-    """所有邮箱服务商统一以 CPA 的 success 状态作为注册成功标准。"""
-    return cpa_conversion_succeeded(cpa_detail)
-
-
-def cpa_failure_reason(cpa_detail=None) -> str:
-    detail = dict(cpa_detail or {})
-    error = str(detail.get("error") or "").strip()
-    status = str(detail.get("status") or "not_attempted").strip() or "not_attempted"
-    return error or f"CPA 转换状态为 {status}，未达到 success"
-
-
-def default_email_disable_detail(provider="", cpa_detail=None) -> dict:
+def default_email_disable_detail(provider="", _legacy_detail=None) -> dict:
     if not is_outlookemail_registration(provider):
         status = "not_applicable"
-    elif not cpa_conversion_succeeded(cpa_detail):
-        status = "skipped_cpa"
-    elif not bool(config.get("outlookemail_disable_after_cpa_success", False)):
+    elif not bool(config.get("outlookemail_disable_after_registration_success", False)):
         status = "feature_disabled"
     elif get_outlookemail_source() != "accounts":
         status = "unsupported_source"
@@ -717,14 +400,12 @@ def persist_registration_result(
     status="failure",
     provider="",
     worker_id=0,
-    cpa_detail=None,
+    platform="xai",
     email_disable_detail=None,
     failure_type="",
     failure_reason="",
     screenshot_path="",
     account_file="",
-    sso_saved=False,
-    nsfw_status="",
     extra=None,
     log_callback=None,
 ):
@@ -740,27 +421,9 @@ def persist_registration_result(
     finished_text = datetime.datetime.fromtimestamp(finished_epoch).astimezone().strftime(
         "%Y-%m-%d %H:%M:%S"
     )
-    detail = dict(cpa_detail or {})
     provider_name = provider or str(config.get("email_provider", "") or "")
-    cpa_enabled = bool(detail.get("enabled", config.get("cpa_auto_add", False)))
-    cpa_status = str(
-        detail.get("status")
-        or ("disabled" if not cpa_enabled else "not_attempted")
-    )
-    auth_info = detail.get("auth_info", "")
-    if isinstance(auth_info, (list, tuple, set)):
-        auth_info = "\n".join(str(item) for item in auth_info if str(item).strip())
     extra_data = dict(extra or {})
-    if detail.get("error"):
-        extra_data["cpa_error"] = str(detail.get("error"))
-    if detail.get("mode"):
-        extra_data["cpa_mode"] = str(detail.get("mode"))
-    if isinstance(detail.get("sso_risk_check"), dict):
-        extra_data["sso_risk_check"] = dict(detail["sso_risk_check"])
-    # Sub2API 摘要结果放入 extra，便于后续详情页展示
-    if detail.get("sub2api_remote_result") is not None:
-        extra_data["sub2api_remote_result"] = detail.get("sub2api_remote_result")
-    disable_detail = default_email_disable_detail(provider_name, detail)
+    disable_detail = default_email_disable_detail(provider_name)
     disable_detail.update(dict(email_disable_detail or {}))
     try:
         repository = get_registration_repository()
@@ -777,29 +440,7 @@ def persist_registration_result(
                 "success": status == "success",
                 "provider": provider_name,
                 "worker_id": worker_id,
-                "cpa_enabled": cpa_enabled,
-                "cpa_status": cpa_status,
-                "auth_info": auth_info,
-                "auth_path": detail.get("auth_path", ""),
-                "cpa_auth_path": detail.get("cpa_auth_path", ""),
-                "grok2api_auth_path": detail.get("grok2api_auth_path", ""),
-                "cpa_remote_status": detail.get("cpa_remote_status", "not_configured"),
-                "cpa_remote_imported_at": detail.get("cpa_remote_imported_at", ""),
-                "cpa_remote_error": detail.get("cpa_remote_error", ""),
-                "grok2api_remote_status": detail.get(
-                    "grok2api_remote_status", "not_configured"
-                ),
-                "grok2api_remote_imported_at": detail.get(
-                    "grok2api_remote_imported_at", ""
-                ),
-                "grok2api_remote_error": detail.get("grok2api_remote_error", ""),
-                "sub2api_remote_status": detail.get(
-                    "sub2api_remote_status", "disabled"
-                ),
-                "sub2api_remote_imported_at": detail.get(
-                    "sub2api_remote_imported_at", ""
-                ),
-                "sub2api_remote_error": detail.get("sub2api_remote_error", ""),
+                "platform": platform,
                 "email_account_id": disable_detail.get("account_id", ""),
                 "email_disable_status": disable_detail.get("status", "not_attempted"),
                 "email_disabled_at": disable_detail.get("disabled_at", ""),
@@ -808,33 +449,9 @@ def persist_registration_result(
                 "failure_reason": str(failure_reason or ""),
                 "screenshot_path": screenshot_path,
                 "account_file": account_file,
-                "sso_saved": sso_saved,
-                "nsfw_status": nsfw_status,
-                "bot_risk": bool(detail.get("bot_risk")),
-                "bfs": "" if detail.get("bfs") is None else detail.get("bfs"),
                 "extra": extra_data,
             }
         )
-        if _grokiq.grok_build_import_succeeded(
-            detail.get("grok2api_remote_result")
-        ):
-            try:
-                record = repository.get_results_by_ids([registration_id])[0]
-                event = _grokiq.enqueue_imported_account(
-                    repository,
-                    record,
-                    config,
-                )
-                if event and log_callback:
-                    log_callback(
-                        "[GrokIQ] 已加入联动通知队列: "
-                        f"{event.get('event_id')}"
-                    )
-            except Exception as grokiq_exc:
-                if log_callback:
-                    log_callback(
-                        f"[GrokIQ] 账号已导入 Grok2API，但联动通知入队失败: {grokiq_exc}"
-                    )
         return registration_id
     except Exception as exc:
         if log_callback:
@@ -1093,12 +710,12 @@ def reset_outlookemail_runtime_state():
     outlookemail_provider.reset_runtime_state()
 
 
-def disable_outlookemail_after_cpa_success(email, cpa_detail=None, log_callback=None) -> dict:
-    """CPA 成功后停用 accounts 来源邮箱；结果独立记录，不改变 CPA 成功状态。"""
-    detail = default_email_disable_detail("outlookemail", cpa_detail)
+def disable_outlookemail_after_registration_success(email, log_callback=None) -> dict:
+    """注册成功后停用 accounts 来源邮箱；停用结果不改变注册成功状态。"""
+    detail = default_email_disable_detail("outlookemail")
     if detail["status"] != "not_attempted":
         if log_callback and detail["status"] == "feature_disabled":
-            log_callback("[*] OutlookEmail CPA 成功后停用功能未开启")
+            log_callback("[*] OutlookEmail 注册成功后停用功能未开启")
         return detail
 
     normalized_email = str(email or "").strip()
@@ -1113,7 +730,7 @@ def disable_outlookemail_after_cpa_success(email, cpa_detail=None, log_callback=
         detail["account_id"] = str(account.get("id") or "")
         if log_callback:
             log_callback(
-                f"[OutlookEmail] CPA 转换成功，正在停用邮箱账号 ID={detail['account_id'] or '-'}"
+                f"[OutlookEmail] 注册成功，正在停用邮箱账号 ID={detail['account_id'] or '-'}"
             )
         result = outlookemail_provider.disable_account(
             http_get,
@@ -1138,7 +755,7 @@ def disable_outlookemail_after_cpa_success(email, cpa_detail=None, log_callback=
     except Exception as exc:
         detail.update(status="failed", error=str(exc))
         if log_callback:
-            log_callback(f"[!] OutlookEmail 邮箱停用失败，CPA 成功记录保留: {exc}")
+            log_callback(f"[!] OutlookEmail 邮箱停用失败，注册成功记录保留: {exc}")
     return detail
 
 
@@ -1149,8 +766,8 @@ def maybe_disable_outlookemail_for_consumed_failure(
     reason: str = "",
     log_callback=None,
 ) -> dict | None:
-    """账号已注册、注册风控或 SSO 超时停用 Outlook 邮箱；邮箱已消耗，避免再次取用。"""
-    if kind not in {FAIL_ALREADY_REGISTERED, FAIL_RISK, FAIL_SSO}:
+    """账号已注册时停用 Outlook 邮箱；邮箱已消耗，避免再次取用。"""
+    if kind != FAIL_ALREADY_REGISTERED:
         return None
     if not is_outlookemail_registration() or not str(email or "").strip():
         return None
@@ -1183,9 +800,9 @@ def disable_outlookemail_consumed(
     reason: str = "",
     log_callback=None,
 ) -> dict:
-    """在账号已存在 / 注册风控 / SSO 超时 / 已拿 SSO 等场景下停用 Outlook 邮箱，避免重复取用。
+    """在账号已存在等邮箱已消耗场景下停用 Outlook 邮箱，避免重复取用。
 
-    与 CPA 成功后停用共用同一开关 outlookemail_disable_after_cpa_success：
+    与注册成功后停用共用同一开关 ``outlookemail_disable_after_registration_success``：
     仅在开关开启且来源为 accounts 时才会远程停用。
     """
     if not is_outlookemail_registration():
@@ -1197,7 +814,7 @@ def disable_outlookemail_consumed(
             "disabled_at": "",
             "error": "",
         }
-    if not bool(config.get("outlookemail_disable_after_cpa_success", False)):
+    if not bool(config.get("outlookemail_disable_after_registration_success", False)):
         if log_callback:
             log_callback("[*] OutlookEmail 自动停用功能未开启，跳过停用")
         return {
@@ -1416,585 +1033,6 @@ def get_user_agent():
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     )
 
-
-def _normalize_sso_token(raw_token):
-    token = str(raw_token or "").strip()
-    if token.startswith("sso="):
-        token = token[4:]
-    return token
-
-
-def _resolve_cpa_proxy():
-    """CPA 换 token 用的代理：优先 config.proxy，其次环境变量，否则直连。"""
-    proxy = resolve_proxy_url(config.get("proxy", ""))
-    if proxy:
-        return proxy
-    for key in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"):
-        val = str(os.environ.get(key, "") or "").strip()
-        if val:
-            return val
-    return ""
-
-
-def _append_sso_pending(email: str, sso: str, log_callback=None):
-    """授权转换失败时保留 SSO，便于之后重新交换凭据。"""
-    try:
-        path = accounts_side_file("sso_pending.txt")
-        line = f"{email}----{sso}\n" if email else f"{sso}\n"
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line)
-        if log_callback:
-            log_callback(f"[CPA] 已追加待重转 SSO → {path}")
-    except Exception as exc:
-        if log_callback:
-            log_callback(f"[CPA] 写入 sso_pending 失败: {exc}")
-
-
-def _append_sso_risk_rejected(email: str, sso: str, details: str, log_callback=None):
-    """保存注册风控拒绝的 SSO；该类账号不进入待重转队列。"""
-    try:
-        path = accounts_side_file("sso_risk_rejected.txt")
-        safe_details = re.sub(r"[\r\n\t]+", " ", str(details or "")).strip()
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(f"{email}----{sso}----{safe_details}\n")
-        if log_callback:
-            log_callback(f"[CPA] 已保存注册风控拒绝记录 → {path}")
-    except Exception as exc:
-        if log_callback:
-            log_callback(f"[CPA] 保存注册风控拒绝记录失败: {exc}")
-
-
-def _inspect_sso_detailed_risk(sso: str, email: str, proxy: str) -> dict:
-    """使用独立 SSO Checker 返回不含凭据的详细账号与 botFlag 结果。"""
-    checker = _sso_checker.SsoChecker(
-        _sso_checker.SsoCheckConfig(
-            proxy=proxy,
-            user_agent=get_user_agent(),
-        )
-    )
-    result = checker.check(
-        _sso_checker.SsoCredential(
-            sso_token=sso,
-            expected_email=str(email or "").strip(),
-            label=str(email or "").strip(),
-        )
-    )
-    state = result.to_dict(flagged_sources=checker.config.flagged_sources)
-    bot_flag = dict(state.get("bot_flag") or {})
-    state.update(
-        {
-            "enabled": True,
-            "mode": "detailed",
-            "found": bool(bot_flag.get("found")),
-            "flagged": bool(bot_flag.get("flagged")),
-            "bot_flag_source": bot_flag.get("source"),
-            "bot_flag_details": str(bot_flag.get("details") or ""),
-            "policy": str(bot_flag.get("policy") or ""),
-            "risk": bot_flag.get("risk"),
-            "event": str(bot_flag.get("event") or ""),
-            "denied": bool(bot_flag.get("denied")),
-        }
-    )
-    return state
-
-
-def ensure_sso_oauth_eligible(
-    raw_token,
-    email="",
-    log_callback=None,
-    result_out=None,
-) -> dict:
-    """按配置复查 SSO 风控状态；详细模式同时验证会话与账号资料。"""
-    detailed = bool(config.get("sso_detailed_risk_check", False))
-    if not detailed and not bool(config.get("cpa_registration_risk_check", False)):
-        return {}
-    if not detailed:
-        if not config.get("cpa_auto_add", False):
-            return {}
-        if not any(
-            str(config.get(key, "") or "").strip()
-            for key in ("cpa_auth_dir", "cpa_remote_url", "grok2api_auth_dir")
-        ):
-            return {}
-    sso = _normalize_sso_token(raw_token)
-    if not sso:
-        raise RegistrationRiskDenied("注册风控检查失败: sso 为空")
-
-    def _risk_log(message):
-        if log_callback:
-            prefix = "[SSO风控]" if detailed else "[CPA]"
-            log_callback(f"{prefix} {str(message).strip()}")
-
-    def _set_risk_state(state):
-        if detailed and isinstance(result_out, dict):
-            result_out["sso_risk_check"] = dict(state or {})
-
-    def _source_status(value):
-        if value is None or value == "":
-            return "unknown"
-        if isinstance(value, bool):
-            return "flagged"
-        try:
-            return "clean" if int(value) == 0 else "flagged"
-        except (TypeError, ValueError):
-            return "unknown"
-
-    retry_delays = (0, 2, 4, 8)
-    proxy = _resolve_cpa_proxy()
-    last_state = {}
-
-    for attempt, delay in enumerate(retry_delays, start=1):
-        if delay:
-            _risk_log(f"风控字段尚未稳定，{delay}s 后进行第 {attempt} 次检查")
-            time.sleep(delay)
-        mode_label = "详细检查 SSO 会话与 botFlag" if detailed else "检查新账号注册风控状态"
-        _risk_log(f"{mode_label} ({attempt}/{len(retry_delays)}) ...")
-        if detailed:
-            state = _inspect_sso_detailed_risk(sso, email, proxy)
-        else:
-            state = _s2cpa.inspect_sso_account_state(
-                sso,
-                proxy=proxy,
-                log=_risk_log,
-            )
-        last_state = state
-        _set_risk_state(state)
-        source = state.get("bot_flag_source")
-        # 服务端约定：0 为正常；null/缺失为未知；任何非零值均属于异常。
-        source_status = _source_status(source)
-        source_clean = source_status == "clean"
-        source_flagged = source_status == "flagged"
-        if source_flagged:
-            details = str(
-                state.get("bot_flag_details")
-                or f"botFlagSource={source},policy=unknown,event=unknown"
-            )
-            _append_sso_risk_rejected(email, sso, details, log_callback=log_callback)
-            raise RegistrationRiskDenied(
-                "注册风控拒绝，已跳过 OAuth: "
-                f"botFlagSource={source} {details}",
-                bot_risk=True,
-                bot_flag_source=source,
-                bot_flag_details=details,
-                risk_state=state,
-            )
-
-        # 明确读取到非风险状态后即可继续；字段为空时短时复查，避免注册结果延迟写入。
-        if detailed:
-            if (
-                state.get("valid_session")
-                and state.get("found")
-                and source_clean
-            ):
-                if state.get("email_match") is False:
-                    server_email = str((state.get("account") or {}).get("email") or "")
-                    _risk_log(
-                        "SSO 账号邮箱与本次注册邮箱不一致，继续记录检查结果: "
-                        f"expected={email or '-'} actual={server_email or '-'}"
-                    )
-                _risk_log(
-                    "详细风控检查通过: "
-                    f"botFlagSource={source!r} "
-                    f"policy={state.get('policy') or '-'} "
-                    f"risk={state.get('risk')!r}"
-                )
-                return state
-        elif state.get("found") and (
-            source in (0, "0")
-        ):
-            return state
-
-        _risk_log(
-            "本次未得到稳定风控结论: "
-            f"{state.get('error') or 'botFlag 字段为空'}"
-        )
-
-    reason = str(last_state.get("error") or "botFlag 字段持续为空")
-    _risk_log(f"注册风控状态无法确认，继续 OAuth: {reason}")
-    return last_state
-
-
-def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> bool:
-    """SSO → Device Flow（失败回退授权码）换 token → 写入 CPA / Grok2API。
-
-    返回 True 表示入库成功（或未开启/无需转换）；False 表示转换失败（SSO 仍可能已写入 accounts）。
-    """
-    result = result_out if isinstance(result_out, dict) else None
-
-    def _set_result(**values):
-        if result is not None:
-            result.update(values)
-
-    cpa_enabled = bool(config.get("cpa_auto_add", False))
-    # CPA 远程上传独立开关，默认开启以保持旧行为
-    cpa_upload_enabled = bool(config.get("cpa_upload_enabled", True))
-    # Sub2API：默认关闭，需显式开启；失败不拉低注册成功判定
-    sub2api_enabled = bool(config.get("sub2api_enabled", False))
-    sub2api_configured = _sub2api.Sub2APIClient.is_configured(config)
-    if not sub2api_enabled:
-        sub2api_status = "disabled"
-    elif sub2api_configured:
-        sub2api_status = "ready"
-    else:
-        sub2api_status = "not_configured"
-    _set_result(
-        enabled=cpa_enabled,
-        status="not_attempted" if cpa_enabled else "disabled",
-        mode=str(config.get("cpa_token_mode", "device_protocol") or "device_protocol"),
-        auth_info=[],
-        auth_path="",
-        cpa_auth_path="",
-        grok2api_auth_path="",
-        cpa_remote_status="not_configured",
-        cpa_remote_imported_at="",
-        cpa_remote_error="",
-        grok2api_remote_status="not_configured",
-        grok2api_remote_imported_at="",
-        grok2api_remote_error="",
-        sub2api_remote_status=sub2api_status,
-        sub2api_remote_imported_at="",
-        sub2api_remote_error="",
-        sub2api_remote_result=None,
-        bot_risk=False,
-        bfs="",
-        error="",
-    )
-    if not cpa_enabled:
-        if log_callback:
-            log_callback("[*] 已关闭 SSO→auth，仅保存 SSO；CPA 非 success，本账号不计注册成功")
-        return True
-    auth_dir = str(config.get("cpa_auth_dir", "") or "").strip()
-    remote_url = str(config.get("cpa_remote_url", "") or "").strip()
-    management_key = str(config.get("cpa_management_key", "") or "").strip()
-    g2a_dir = str(config.get("grok2api_auth_dir", "") or "").strip()
-    g2a_remote_configured = _grok2api.Grok2APIClient.is_configured(config)
-    g2a_auto_import = bool(config.get("grok2api_auto_import", False))
-    g2a_import_formats = _grok2api.Grok2APIClient.auto_import_formats(config)
-    _set_result(
-        cpa_remote_status="ready" if remote_url and management_key else "not_configured",
-        grok2api_remote_status="ready" if g2a_remote_configured else "not_configured",
-    )
-
-    # 相对路径基于项目根目录解析，并自动创建目录
-    if auth_dir and not os.path.isabs(auth_dir):
-        auth_dir = os.path.join(APP_DIR, auth_dir)
-    if g2a_dir and not os.path.isabs(g2a_dir):
-        g2a_dir = os.path.join(APP_DIR, g2a_dir)
-
-    preflight_errors = []
-    if not auth_dir and not remote_url and not g2a_dir:
-        _set_result(status="skipped", error="未配置 CPA/Grok2API 授权目标")
-        if log_callback:
-            log_callback(
-                "[Debug] 已开启 SSO→auth 但未配置 cpa_auth_dir / cpa_remote_url / grok2api_auth_dir，跳过"
-            )
-        return True
-    if remote_url and not management_key:
-        remote_error = "远程 CPA 缺少管理密钥"
-        preflight_errors.append(remote_error)
-        _set_result(auth_info=list(preflight_errors), error=remote_error)
-        if log_callback:
-            log_callback("[Debug] 已配置 cpa_remote_url 但未配置 cpa_management_key，跳过远程上传")
-        remote_url = ""
-    if not auth_dir and not remote_url and not g2a_dir:
-        error_text = "; ".join(preflight_errors) or "没有可用的 CPA/Grok2API 授权目标"
-        _set_result(status="skipped", auth_info=list(preflight_errors), error=error_text)
-        return True
-    sso = _normalize_sso_token(raw_token)
-    if not sso:
-        _set_result(status="failed", error="SSO 为空")
-        return False
-    proxy = _resolve_cpa_proxy()
-
-    def _cpa_log(message):
-        if log_callback:
-            log_callback(f"[CPA] {redact_proxy_text(message).strip()}")
-
-    try:
-        token_mode = str(config.get("cpa_token_mode", "device_protocol") or "device_protocol").lower()
-        if token_mode not in ("device_protocol", "device_browser", "auth_code"):
-            token_mode = "device_protocol"
-        _set_result(mode=token_mode)
-        _mode_labels = {
-            "device_protocol": "协议 Device Flow",
-            "device_browser": "浏览器 Device Flow",
-            "auth_code": "Authorization Code",
-        }
-        _cpa_log(f"SSO → {_mode_labels.get(token_mode, token_mode)} 换 token (proxy={proxy}) ...")
-
-        def _browser_approve(user_code, open_url):
-            return authorize_device_in_browser(
-                user_code,
-                open_url,
-                timeout=90,
-                log_callback=log_callback,
-                cancel_callback=None,
-            )
-
-        # device_browser 模式：需要活动浏览器来点「继续/允许」
-        # device_protocol 模式：纯 HTTP 协议换 token，不依赖浏览器
-        # auth_code 模式：走授权码流程
-        use_browser = token_mode == "device_browser" and _active_page() is not None
-        if token_mode == "device_browser" and not use_browser:
-            _cpa_log("无活动浏览器，回退到协议 Device Flow")
-            token_mode = "device_protocol"
-            _set_result(mode=token_mode)
-
-        # sso_to_token 的 prefer 只区分 device / auth_code
-        # browser_approve 是否传入决定走浏览器还是协议
-        prefer = "auth_code" if token_mode == "auth_code" else "device"
-        browser_cb = _browser_approve if use_browser else None
-
-        token = _s2cpa.sso_to_token(
-            sso,
-            proxy=proxy,
-            log=_cpa_log,
-            prefer=prefer,
-            allow_fallback=True,
-            browser_approve=browser_cb,
-        )
-        if not token:
-            _set_result(status="failed", error="SSO 换 token 失败")
-            _cpa_log("换 token 失败；SSO 已在 accounts 文件，稍后可重转")
-            _append_sso_pending(email, sso, log_callback=log_callback)
-            return False
-        record = _s2cpa.token_to_cpa_record(token, email=email, sso=sso)
-        access_token = str(record.get("access_token") or "")
-        ap = _s2cpa.decode_jwt_payload(access_token)
-        ref = ap.get("referrer")
-        if ref:
-            _cpa_log(f"access_token referrer={ref!r}")
-        bfs = _s2cpa.access_token_bfs(access_token)
-        bot_risk = _s2cpa.access_token_bot_risk(access_token)
-        _set_result(bfs=bfs if bfs is not None else "", bot_risk=bot_risk)
-        if bot_risk:
-            _cpa_log(f"access_token 风控标记 bfs={bfs!r}")
-        elif bfs is not None:
-            _cpa_log(f"access_token bfs={bfs!r}")
-        wrote_ok = False
-        auth_entries = []
-        auth_errors = list(preflight_errors)
-        auth_path_value = ""
-        cpa_auth_path_value = ""
-        grok2api_auth_path_value = ""
-        if auth_dir:
-            try:
-                path = _s2cpa.write_cpa_auth(_s2cpa.Path(auth_dir), record)
-                _cpa_log(f"已写入 CPA 本地 {path}")
-                wrote_ok = True
-                cpa_auth_path_value = str(path)
-                auth_path_value = auth_path_value or str(path)
-                auth_entries.append(f"CPA 本地: {path}")
-            except Exception as local_exc:
-                _cpa_log(f"CPA 本地写入失败: {local_exc}")
-                auth_errors.append(f"CPA 本地失败: {local_exc}")
-        if remote_url and cpa_upload_enabled:
-            try:
-                # CPA 管理端通常是本机或内网服务，远程上传固定直连；
-                # config.proxy 只用于 xAI/Grok 的 SSO→token/Auth 链路。
-                _cpa_log(f"CPA 远程上传网络: 直连 -> {remote_url.rstrip('/')}")
-                name = _s2cpa.upload_cpa_auth_remote(
-                    remote_url,
-                    management_key,
-                    record,
-                    proxy="",
-                )
-                _cpa_log(f"已上传 CPA 远程 {remote_url.rstrip('/')}/.../{name}")
-                wrote_ok = True
-                auth_entries.append(f"CPA 远程: {remote_url.rstrip('/')}/.../{name}")
-                _set_result(
-                    cpa_remote_status="success",
-                    cpa_remote_imported_at=RegistrationRepository.now_text(),
-                    cpa_remote_error="",
-                )
-            except Exception as remote_exc:
-                _cpa_log(f"CPA 远程上传失败: {remote_exc}")
-                auth_errors.append(f"CPA 远程失败: {remote_exc}")
-                _set_result(cpa_remote_status="failed", cpa_remote_error=str(remote_exc))
-        elif remote_url and not cpa_upload_enabled:
-            # 配了远程地址但关闭上传开关：仅本地保存
-            _cpa_log("已配置 CPA 远程地址，但上传开关关闭，仅保存本地")
-            _set_result(cpa_remote_status="disabled")
-        if g2a_dir:
-            try:
-                gpaths = _s2cpa.write_grok2api_auth_bundle(
-                    _s2cpa.Path(g2a_dir), token, email=email, sso=sso
-                )
-                gpath = gpaths["grok_build"]
-                _cpa_log(
-                    "已写入 Grok2API "
-                    + ", ".join(f"{kind}={path}" for kind, path in gpaths.items())
-                )
-                wrote_ok = True
-                grok2api_auth_path_value = str(gpath)
-                auth_path_value = auth_path_value or str(gpath)
-                auth_entries.extend(f"Grok2API {kind}: {path}" for kind, path in gpaths.items())
-                if g2a_remote_configured and g2a_import_formats:
-                    _cpa_log(
-                        "Grok2API 远程导入网络: 直连 -> "
-                        f"{str(config.get('grok2api_remote_url') or '').rstrip('/')} "
-                        f"formats={','.join(g2a_import_formats)}"
-                    )
-                    remote_results = {}
-                    remote_errors = {}
-                    try:
-                        with _grok2api.Grok2APIClient.from_config(config) as client:
-                            for format_name in g2a_import_formats:
-                                format_path = gpaths.get(format_name)
-                                if not format_path:
-                                    remote_errors[format_name] = "授权 JSON 不存在"
-                                    _cpa_log(f"Grok2API 远程导入跳过 [{format_name}]: 授权 JSON 不存在")
-                                    continue
-                                try:
-                                    remote_result = client.import_auth_file(
-                                        format_path, format_name=format_name
-                                    )
-                                    remote_results[format_name] = remote_result
-                                    _cpa_log(
-                                        f"已导入远程 Grok2API {format_name} "
-                                        f"(created={remote_result.get('created', 0)}, "
-                                        f"updated={remote_result.get('updated', 0)}, "
-                                        f"synced={remote_result.get('synced', 0)})"
-                                    )
-                                except Exception as remote_g2a_exc:
-                                    remote_errors[format_name] = str(remote_g2a_exc)
-                                    _cpa_log(
-                                        f"Grok2API 远程导入失败 [{format_name}]: {remote_g2a_exc}"
-                                    )
-                    except Exception as remote_client_exc:
-                        remote_errors["client"] = str(remote_client_exc)
-                        _cpa_log(f"Grok2API 远程客户端初始化失败: {remote_client_exc}")
-                    imported_at = RegistrationRepository.now_text()
-                    sync_failed = sum(
-                        int(result.get("syncFailed", 0) or 0)
-                        for result in remote_results.values()
-                    )
-                    if remote_errors:
-                        remote_status = "partial" if remote_results else "failed"
-                    else:
-                        remote_status = "partial" if sync_failed else "success"
-                    remote_error_parts = [
-                        f"{format_name}: {error}"
-                        for format_name, error in remote_errors.items()
-                    ]
-                    auth_errors.extend(remote_error_parts)
-                    if sync_failed:
-                        remote_error_parts.append(f"远程同步失败 {sync_failed} 个")
-                    _set_result(
-                        grok2api_remote_status=remote_status,
-                        grok2api_remote_imported_at=imported_at if remote_results else "",
-                        grok2api_remote_error="; ".join(remote_error_parts),
-                        grok2api_remote_result={
-                            "formats": remote_results,
-                            "errors": remote_errors,
-                        },
-                    )
-                elif g2a_remote_configured:
-                    if g2a_auto_import and not g2a_import_formats:
-                        _cpa_log("已开启 Grok2API 自动导入，但未勾选 Build / Web / Console")
-                    _set_result(grok2api_remote_status="ready")
-            except Exception as g2a_exc:
-                _cpa_log(f"Grok2API 写入失败: {g2a_exc}")
-                auth_errors.append(f"Grok2API 失败: {g2a_exc}")
-
-        # Sub2API 分支：与 CPA/Grok2API 并列，独立 try/except，不参与 wrote_ok
-        # 服务端自行 SSO→OAuth，这里只传原始 SSO 字符串
-        if sub2api_enabled and sub2api_configured:
-            try:
-                name_prefix = str(config.get("sub2api_name_prefix", "") or "").strip()
-                group_ids = _sub2api.Sub2APIClient.parse_group_ids(
-                    config.get("sub2api_group_ids", "")
-                )
-                _cpa_log(
-                    "[Sub2API] 远程上传网络: 直连 -> "
-                    f"{str(config.get('sub2api_remote_url') or '').rstrip('/')}"
-                )
-                with _sub2api.Sub2APIClient.from_config(config) as sub2_client:
-                    remote_result = sub2_client.sso_to_oauth(
-                        [sso],
-                        name=name_prefix,
-                        proxy_id=config.get("sub2api_proxy_id", 0),
-                        group_ids=group_ids,
-                        concurrency=config.get("sub2api_concurrency", 1),
-                        priority=config.get("sub2api_priority", 0),
-                    )
-                created = remote_result.get("created") or []
-                failed = remote_result.get("failed") or []
-                created_n = len(created) if isinstance(created, list) else int(bool(created))
-                failed_n = len(failed) if isinstance(failed, list) else int(bool(failed))
-                if failed_n and created_n:
-                    remote_status = "partial"
-                elif failed_n and not created_n:
-                    remote_status = "failed"
-                else:
-                    remote_status = "success"
-                error_text = ""
-                if failed_n:
-                    error_text = f"failed={failed_n}"
-                    if isinstance(failed, list) and failed:
-                        error_text = f"{error_text}: {failed[:3]}"
-                _set_result(
-                    sub2api_remote_status=remote_status,
-                    sub2api_remote_imported_at=RegistrationRepository.now_text(),
-                    sub2api_remote_error=error_text,
-                    sub2api_remote_result={
-                        "created_count": created_n,
-                        "failed_count": failed_n,
-                        "created": created if isinstance(created, list) else created,
-                        "failed": failed if isinstance(failed, list) else failed,
-                    },
-                )
-                if remote_status == "success":
-                    _cpa_log(f"[Sub2API] 已上传 (created={created_n})")
-                else:
-                    _cpa_log(
-                        f"[Sub2API] 上传结果 {remote_status} "
-                        f"(created={created_n}, failed={failed_n})"
-                    )
-            except Exception as sub2_exc:
-                # 不写入 auth_errors，避免影响 CPA 成功判定
-                _cpa_log(f"[Sub2API] 上传失败: {sub2_exc}")
-                _set_result(
-                    sub2api_remote_status="failed",
-                    sub2api_remote_error=str(sub2_exc),
-                    sub2api_remote_result=None,
-                )
-        elif sub2api_enabled and not sub2api_configured:
-            _cpa_log("[Sub2API] 已开启但未配齐 remote_url / api_key，跳过上传")
-            _set_result(sub2api_remote_status="not_configured")
-        else:
-            _set_result(sub2api_remote_status="disabled")
-
-        if not wrote_ok:
-            error_text = "; ".join(auth_errors) or "CPA/Grok2API 均未写入成功"
-            _set_result(
-                status="failed",
-                auth_info=auth_entries + auth_errors,
-                auth_path=auth_path_value,
-                cpa_auth_path=cpa_auth_path_value,
-                grok2api_auth_path=grok2api_auth_path_value,
-                error=error_text,
-            )
-            _cpa_log("token 已换出但 CPA/Grok2API 均未写入成功")
-            _append_sso_pending(email, sso, log_callback=log_callback)
-            return False
-        _set_result(
-            status="success",
-            auth_info=auth_entries + auth_errors,
-            auth_path=auth_path_value,
-            cpa_auth_path=cpa_auth_path_value,
-            grok2api_auth_path=grok2api_auth_path_value,
-            error="; ".join(auth_errors),
-        )
-        return True
-    except Exception as exc:
-        _set_result(status="failed", error=str(exc))
-        _cpa_log(f"直出失败: {exc}")
-        _append_sso_pending(email, sso, log_callback=log_callback)
-        return False
-
-
-# 浏览器启动参数由 automation.session 统一生成。
 
 def _build_request_kwargs(**kwargs):
     request_kwargs = dict(kwargs)
@@ -2570,326 +1608,6 @@ def is_cloudflare_block_response(res):
         return False
 
 
-def set_birth_date(session, log_callback=None):
-    url = "https://grok.com/rest/auth/set-birth-date"
-    new_headers = {
-        "content-type": "application/json",
-        "origin": "https://grok.com",
-        "referer": "https://grok.com/",
-    }
-    payload = {"birthDate": generate_random_birthdate()}
-    try:
-        res = session.post(url, json=payload, headers=new_headers, timeout=15)
-        body_preview = response_preview(res)
-        if log_callback:
-            log_callback(
-                f"[Debug] set_birth_date status: {res.status_code}, body: {body_preview}"
-            )
-        if 200 <= res.status_code < 300:
-            return True, "ok"
-        # 生日一旦写过就不能改；算已完成，不能当失败中断后续 NSFW
-        text = str(res.text or "")
-        if res.status_code in (400, 409, 429) and (
-            "birth-date-change-limit-reached" in text
-            or "Birth date is locked" in text
-            or "already set" in text.lower()
-        ):
-            return True, "already_set"
-        if is_cloudflare_block_response(res):
-            return (
-                False,
-                "set_birth_date 被 grok.com 的 Cloudflare 防护拦截，HTTP "
-                f"{res.status_code}",
-            )
-        return False, f"set_birth_date HTTP {res.status_code}: {body_preview}"
-    except Exception as e:
-        if log_callback:
-            log_callback(f"[set_birth_date] 异常: {e}")
-        return False, f"set_birth_date 异常: {e}"
-
-
-def set_tos_accepted(session, log_callback=None):
-    url = "https://accounts.x.ai/auth_mgmt.AuthManagement/SetTosAcceptedVersion"
-    payload = struct.pack("B", (2 << 3) | 0) + struct.pack("B", 1)
-    data = b"\x00" + struct.pack(">I", len(payload)) + payload
-    new_headers = {
-        "content-type": "application/grpc-web+proto",
-        "x-grpc-web": "1",
-        "x-user-agent": "connect-es/2.1.1",
-        "origin": "https://accounts.x.ai",
-        "referer": "https://accounts.x.ai/accept-tos",
-    }
-    try:
-        res = session.post(url, data=data, headers=new_headers, timeout=15)
-        if log_callback:
-            log_callback(f"[Debug] set_tos_accepted status: {res.status_code}")
-        if 200 <= res.status_code < 300:
-            return True, "ok"
-        if is_cloudflare_block_response(res):
-            return (
-                False,
-                "set_tos_accepted 被 accounts.x.ai 的 Cloudflare 防护拦截，HTTP "
-                f"{res.status_code}",
-            )
-        return False, f"set_tos_accepted HTTP {res.status_code}: {response_preview(res)}"
-    except Exception as e:
-        if log_callback:
-            log_callback(f"[set_tos_accepted] 异常: {e}")
-        return False, f"set_tos_accepted 异常: {e}"
-
-
-def encode_grpc_nsfw_settings():
-    field1_content = bytes([0x10, 0x01])
-    field1 = bytes([0x0A, len(field1_content)]) + field1_content
-    nsfw_string = b"always_show_nsfw_content"
-    field2_inner = bytes([0x0A, len(nsfw_string)]) + nsfw_string
-    field2 = bytes([0x12, len(field2_inner)]) + field2_inner
-    payload = field1 + field2
-    return b"\x00" + struct.pack(">I", len(payload)) + payload
-
-
-def update_nsfw_settings(session, log_callback=None):
-    url = "https://grok.com/auth_mgmt.AuthManagement/UpdateUserFeatureControls"
-    data = encode_grpc_nsfw_settings()
-    new_headers = {
-        "content-type": "application/grpc-web+proto",
-        "x-grpc-web": "1",
-        "origin": "https://grok.com",
-        "referer": "https://grok.com/",
-    }
-    try:
-        res = session.post(url, data=data, headers=new_headers, timeout=15)
-        if log_callback:
-            log_callback(
-                f"[Debug] update_nsfw status: {res.status_code}, body: {response_preview(res)}"
-            )
-        if 200 <= res.status_code < 300:
-            return True, "ok"
-        if is_cloudflare_block_response(res):
-            return (
-                False,
-                "update_nsfw_settings 被 grok.com 的 Cloudflare 防护拦截，HTTP "
-                f"{res.status_code}",
-            )
-        return False, f"update_nsfw_settings HTTP {res.status_code}: {response_preview(res)}"
-    except Exception as e:
-        if log_callback:
-            log_callback(f"[update_nsfw] 异常: {e}")
-        return False, f"update_nsfw_settings 异常: {e}"
-
-
-def enable_nsfw_via_browser(token="", log_callback=None):
-    """在已登录的注册浏览器内调用 grok.com 接口，绕过外部 HTTP 的 CF 拦截。"""
-    page_obj = _active_page()
-    if page_obj is None:
-        return False, "浏览器页面未就绪"
-
-    birth = generate_random_birthdate()
-    nsfw_bytes = encode_grpc_nsfw_settings()
-    nsfw_b64 = base64.b64encode(nsfw_bytes).decode("ascii")
-
-    try:
-        if log_callback:
-            log_callback("[*] 浏览器内开启 NSFW：打开 grok.com ...")
-        # 确保 SSO cookie 在浏览器上下文中
-        if token:
-            try:
-                page_obj.set.cookies(
-                    [
-                        {"name": "sso", "value": token, "domain": ".x.ai", "path": "/"},
-                        {"name": "sso-rw", "value": token, "domain": ".x.ai", "path": "/"},
-                        {"name": "sso", "value": token, "domain": ".grok.com", "path": "/"},
-                        {"name": "sso-rw", "value": token, "domain": ".grok.com", "path": "/"},
-                    ]
-                )
-            except Exception:
-                try:
-                    page_obj.run_js(
-                        """
-const token = arguments[0];
-document.cookie = 'sso=' + token + '; path=/; domain=.grok.com';
-document.cookie = 'sso-rw=' + token + '; path=/; domain=.grok.com';
-                        """,
-                        token,
-                    )
-                except Exception:
-                    pass
-        page_obj.get("https://grok.com/")
-        try:
-            page_obj.wait.doc_loaded()
-        except Exception:
-            pass
-        # 等 CF 挑战结束，否则 fetch 也会拿到 Just a moment
-        for i in range(25):
-            try:
-                title = str(page_obj.run_js("return document.title || '';") or "").lower()
-                body = str(
-                    page_obj.run_js(
-                        "return (document.body && (document.body.innerText||'')) || '';"
-                    )
-                    or ""
-                ).lower()
-                if "just a moment" not in title and "just a moment" not in body[:200]:
-                    if "checking your browser" not in body[:300]:
-                        break
-            except Exception:
-                pass
-            time.sleep(1.0)
-        else:
-            if log_callback:
-                log_callback("[!] grok.com 仍停在 Cloudflare 挑战页，浏览器内 NSFW 可能失败")
-        time.sleep(1.0)
-
-        result = page_obj.run_js(
-            r"""
-const birthDate = arguments[0];
-const nsfwB64 = arguments[1];
-function b64ToBytes(b64) {
-  const bin = atob(b64);
-  const arr = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return arr;
-}
-return (async () => {
-  const out = { birthStatus: 0, birthBody: '', nsfwStatus: 0, nsfwBody: '', url: location.href };
-  try {
-    const birthRes = await fetch('https://grok.com/rest/auth/set-birth-date', {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'content-type': 'application/json',
-        'origin': 'https://grok.com',
-        'referer': 'https://grok.com/',
-      },
-      body: JSON.stringify({ birthDate }),
-    });
-    out.birthStatus = birthRes.status;
-    out.birthBody = (await birthRes.text()).slice(0, 240);
-  } catch (e) {
-    out.birthBody = String(e);
-  }
-  const birthOk = (out.birthStatus >= 200 && out.birthStatus < 300)
-    || /birth-date-change-limit-reached|Birth date is locked|already set/i.test(out.birthBody || '');
-  if (!birthOk && out.birthStatus !== 0) {
-    return out;
-  }
-  try {
-    const body = b64ToBytes(nsfwB64);
-    const nsfwRes = await fetch('https://grok.com/auth_mgmt.AuthManagement/UpdateUserFeatureControls', {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'content-type': 'application/grpc-web+proto',
-        'x-grpc-web': '1',
-        'origin': 'https://grok.com',
-        'referer': 'https://grok.com/',
-      },
-      body,
-    });
-    out.nsfwStatus = nsfwRes.status;
-    out.nsfwBody = (await nsfwRes.text()).slice(0, 240);
-  } catch (e) {
-    out.nsfwBody = String(e);
-  }
-  return out;
-})();
-            """,
-            birth,
-            nsfw_b64,
-        )
-        if not isinstance(result, dict):
-            return False, f"浏览器 NSFW 返回异常: {result!r}"
-
-        if log_callback:
-            log_callback(
-                f"[Debug] browser NSFW birth={result.get('birthStatus')} "
-                f"nsfw={result.get('nsfwStatus')} body={str(result.get('birthBody') or '')[:120]}"
-            )
-
-        birth_status = int(result.get("birthStatus") or 0)
-        birth_body = str(result.get("birthBody") or "")
-        birth_ok = (200 <= birth_status < 300) or (
-            birth_status in (400, 409, 429)
-            and (
-                "birth-date-change-limit-reached" in birth_body
-                or "Birth date is locked" in birth_body
-                or "already set" in birth_body.lower()
-            )
-        )
-        if not birth_ok:
-            if "just a moment" in birth_body.lower() or birth_status == 403:
-                return False, f"浏览器内 set_birth_date 仍被 CF 拦截 HTTP {birth_status}"
-            return False, f"浏览器内 set_birth_date HTTP {birth_status}: {birth_body[:160]}"
-
-        nsfw_status = int(result.get("nsfwStatus") or 0)
-        nsfw_body = str(result.get("nsfwBody") or "")
-        if 200 <= nsfw_status < 300:
-            return True, "成功开启 NSFW（浏览器内）"
-        if "just a moment" in nsfw_body.lower() or nsfw_status == 403:
-            return False, f"浏览器内 update_nsfw 被 CF 拦截 HTTP {nsfw_status}"
-        return False, f"浏览器内 update_nsfw HTTP {nsfw_status}: {nsfw_body[:160]}"
-    except Exception as exc:
-        if log_callback:
-            log_callback(f"[Debug] 浏览器内 NSFW 异常: {exc}")
-        return False, f"浏览器内 NSFW 异常: {exc}"
-
-
-def enable_nsfw_for_token(token, cf_clearance="", user_agent="", log_callback=None):
-    proxies = get_proxies()
-    ua = user_agent or get_user_agent()
-    if log_callback:
-        log_callback(
-            f"[Debug] NSFW 准备: cf_clearance={'有' if cf_clearance else '无'} | ua_len={len(ua)} | browser={'有' if _active_page() else '无'}"
-        )
-
-    # 有活动浏览器时直接走浏览器路径（HTTP 快速路径会被 accounts.x.ai Cloudflare 拦截）
-    if _active_page() is not None:
-        if log_callback:
-            log_callback("[*] NSFW 通过浏览器执行...")
-        return enable_nsfw_via_browser(token=token, log_callback=log_callback)
-
-    # 无活动浏览器时尝试 HTTP 快速路径
-    def _browser_fallback(reason):
-        if _active_page() is None:
-            return False, reason
-        if log_callback:
-            log_callback(f"[*] NSFW HTTP 快速路径未成功: {reason}，回退浏览器过盾...")
-        ok, message = enable_nsfw_via_browser(token=token, log_callback=log_callback)
-        if ok:
-            return True, message
-        return False, f"{reason}; browser fallback: {message}"
-
-    try:
-        if log_callback:
-            log_callback("[*] NSFW 先尝试 HTTP 快速路径...")
-        with requests.Session(impersonate="chrome120", proxies=proxies) as session:
-            cookie_parts = [f"sso={token}", f"sso-rw={token}"]
-            if cf_clearance:
-                cookie_parts.append(f"cf_clearance={cf_clearance}")
-            session.headers.update(
-                {
-                    "user-agent": ua,
-                    "cookie": "; ".join(cookie_parts),
-                    "accept": "application/json, text/plain, */*",
-                    "accept-language": "en-US,en;q=0.9",
-                }
-            )
-            ok, message = set_tos_accepted(session, log_callback)
-            if not ok:
-                return _browser_fallback(message)
-            ok, message = set_birth_date(session, log_callback)
-            if not ok:
-                return _browser_fallback(message)
-            ok, message = update_nsfw_settings(session, log_callback)
-            if not ok:
-                return _browser_fallback(message)
-            return True, "成功开启 NSFW（HTTP 快速路径）"
-    except Exception as e:
-        return _browser_fallback(f"HTTP 快速路径异常: {e}")
-
-
-# 浏览器状态由 automation.session 持有。
-
 def is_debug_mode():
     return bool(config.get("debug_mode", False))
 
@@ -3003,7 +1721,66 @@ def registration_log(message):
     print(line, flush=True)
 
 
-def run_registration(count):
+def run_registration(count, flow_adapter=None):
+    """执行共享注册编排；flow_adapter 只替换目标站点的页面步骤。"""
+    flow_open_signup_page = getattr(flow_adapter, "open_signup_page", open_signup_page)
+    flow_fill_email_and_submit = getattr(
+        flow_adapter, "fill_email_and_submit", fill_email_and_submit
+    )
+    flow_fill_code_and_submit = getattr(
+        flow_adapter, "fill_code_and_submit", fill_code_and_submit
+    )
+    flow_fill_profile_and_submit = getattr(
+        flow_adapter, "fill_profile_and_submit", fill_profile_and_submit
+    )
+    flow_wait_for_completion = getattr(
+        flow_adapter, "wait_for_registration_completion", wait_for_registration_completion
+    )
+    flow_account_file = getattr(flow_adapter, "account_file_for_email", account_file_for_email)
+    flow_last_email = getattr(flow_adapter, "last_acquired_email", _rf.last_acquired_email)
+    flow_last_profile = getattr(flow_adapter, "last_profile", _rf.last_profile)
+    flow_failure_classifier = getattr(flow_adapter, "classify_failure", None)
+    failure_labels = dict(FAIL_LABELS)
+    failure_labels.update(dict(getattr(flow_adapter, "FAILURE_LABELS", {}) or {}))
+    target_label = str(getattr(flow_adapter, "target_label", "xAI / Grok") or "xAI / Grok")
+    result_source = str(getattr(flow_adapter, "result_source", "web") or "web")
+    result_platform = str(getattr(flow_adapter, "result_platform", "xai") or "xai")
+    forced_workers = getattr(flow_adapter, "force_workers", None)
+    connectivity_runner = getattr(
+        flow_adapter, "run_connectivity_checks", _conn.run_connectivity_checks
+    )
+    blocking_connectivity_failure = getattr(
+        flow_adapter, "has_blocking_connectivity_failure", _conn.has_blocking_xai_failure
+    )
+    blocked_connectivity_message = str(
+        getattr(
+            flow_adapter,
+            "blocked_connectivity_message",
+            "xAI 注册页被 Cloudflare 拦截，已停止建号；请更换当前 proxy 后重试",
+        )
+    )
+
+    def _classify(exc):
+        if callable(flow_failure_classifier):
+            custom = str(flow_failure_classifier(exc) or "").strip()
+            if custom:
+                return custom
+        return classify_failure(exc)
+
+    def _attempt_email(email="", exc=None):
+        return str(
+            getattr(exc, "email", "")
+            or email
+            or flow_last_email()
+            or ""
+        ).strip()
+
+    def _attempt_password(profile=None):
+        current = dict(profile or {})
+        if current.get("password"):
+            return str(current.get("password") or "")
+        return str(flow_last_profile().get("password") or "")
+
     controller = RegistrationStopController()
     reset_network_route_logs()
     if get_email_provider() == "outlookemail":
@@ -3012,32 +1789,19 @@ def run_registration(count):
     success_count = 0
     fail_count = 0
     fail_stats = empty_fail_stats()
-    batch_id = new_registration_batch_id("web")
+    batch_source = str(getattr(flow_adapter, "batch_source", "web") or "web")
+    batch_id = new_registration_batch_id(batch_source)
     retry_count_for_slot = 0
     max_slot_retry = 3
     accounts_output_file = ""  # 已改为按邮箱单独保存，不再使用批量文件
     workers = max(1, min(int(config.get("register_workers", 1) or 1), 8, int(count or 1)))
+    if forced_workers is not None:
+        workers = max(1, min(int(forced_workers or 1), 8, int(count or 1)))
     registration_log(f"[*] Web 任务启动，目标数量: {count} | 并发: {workers}")
     _interval_raw = str(config.get("account_interval", "0") or "0").strip()
     if _interval_raw and _interval_raw != "0":
         registration_log(f"[*] 账号间注册间隔: {_interval_raw}s")
-    _token_mode_map = {"device_protocol": "协议 Device Flow", "device_browser": "浏览器 Device Flow", "auth_code": "Authorization Code"}
-    _token_mode_label = _token_mode_map.get(str(config.get("cpa_token_mode", "device_protocol")), "协议 Device Flow")
-    registration_log(f"[*] SSO→auth: {'开' if config.get('cpa_auto_add') else '关（账号将不计成功）'}" + (f"（{_token_mode_label}）" if config.get('cpa_auto_add') else ""))
-    # TokenAuth 各下游上传开关摘要，便于开跑时一眼确认
-    _cpa_up = "开" if config.get("cpa_upload_enabled", True) else "关"
-    _g2a_formats = _grok2api.Grok2APIClient.auto_import_formats(config)
-    if _g2a_formats:
-        _g2a_labels = {
-            "grok_build": "build",
-            "grok_web": "web",
-            "grok_console": "console",
-        }
-        _g2a_up = "开(" + "/".join(_g2a_labels[name] for name in _g2a_formats) + ")"
-    else:
-        _g2a_up = "关"
-    _s2a_up = "开" if config.get("sub2api_enabled", False) else "关"
-    registration_log(f"[*] [TokenAuth] CPA上传={_cpa_up} Grok2API导入={_g2a_up} Sub2API={_s2a_up}")
+    registration_log(f"[*] {target_label} 注册模式：仅保存账号邮箱和密码")
     traceback_log_lock = threading.Lock()
     logged_traceback_signatures = set()
     # 启动前清理上次崩溃 / 强杀残留的临时 profile 目录
@@ -3046,18 +1810,18 @@ def run_registration(count):
     except Exception:
         pass
     try:
-        startup_checks = _conn.run_connectivity_checks(config, http_get, http_post)
+        startup_checks = connectivity_runner(config, http_get, http_post)
         for name, ok, detail in startup_checks:
             registration_log(f"[检查] [{'OK' if ok else 'FAIL'}] {name}: {detail}")
-        if _conn.has_blocking_xai_failure(startup_checks):
-            registration_log("[!] xAI 注册页被 Cloudflare 拦截，已停止建号；请更换当前 proxy 后重试")
+        if blocking_connectivity_failure(startup_checks):
+            registration_log(f"[!] {blocked_connectivity_message}")
             return
     except Exception as exc:
         registration_log(f"[!] 启动连通性检查异常，继续注册: {exc}")
 
     def _record_failure(exc):
         nonlocal fail_count
-        kind = classify_failure(exc)
+        kind = _classify(exc)
         fail_count += 1
         fail_stats[kind] = fail_stats.get(kind, 0) + 1
         return kind
@@ -3090,7 +1854,6 @@ def run_registration(count):
             kwargs["extra"] = extra
         if (
             str(kwargs.get("status") or "").strip().lower() == "failure"
-            and str(kwargs.get("failure_type") or "") != FAIL_CPA
             and not kwargs.get("screenshot_path")
         ):
             kwargs["screenshot_path"] = capture_failure_screenshot(
@@ -3102,7 +1865,8 @@ def run_registration(count):
             )
         return persist_registration_result(
             batch_id=batch_id,
-            source="web",
+            source=result_source,
+            platform=result_platform,
             started_at=started_at,
             provider=str(config.get("email_provider", "") or ""),
             worker_id=int(worker_id) + 1,
@@ -3144,10 +1908,6 @@ def run_registration(count):
                             status="failure",
                             failure_type=FAIL_BROWSER,
                             failure_reason=str(boot_exc),
-                            cpa_detail={
-                                "enabled": bool(config.get("cpa_auto_add", False)),
-                                "status": "not_attempted" if config.get("cpa_auto_add") else "disabled",
-                            },
                         )
                     return
                 i = 0
@@ -3156,156 +1916,80 @@ def run_registration(count):
                     attempt_started_at = time.time()
                     email = ""
                     profile = {}
-                    sso = ""
                     email_file = ""
-                    cpa_detail = {
-                        "enabled": bool(config.get("cpa_auto_add", False)),
-                        "status": "not_attempted" if config.get("cpa_auto_add") else "disabled",
-                    }
-                    nsfw_status = "未执行"
                     try:
-                        open_signup_page(
+                        flow_open_signup_page(
                             log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
                         )
-                        email, dev_token, submitted_at = fill_email_and_submit(
+                        email, dev_token, submitted_at = flow_fill_email_and_submit(
                             log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
                         )
-                        code = fill_code_and_submit(
+                        code = flow_fill_code_and_submit(
                             email,
                             dev_token,
                             submitted_at=submitted_at,
                             log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
                         )
-                        profile = fill_profile_and_submit(
+                        profile = flow_fill_profile_and_submit(
                             log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
                         )
-                        sso = wait_for_sso_cookie(
+                        flow_wait_for_completion(
                             log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
                         )
-                        ensure_sso_oauth_eligible(
-                            sso,
-                            email=email,
-                            log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
-                            result_out=cpa_detail,
-                        )
-                        if config.get("enable_nsfw", True):
-                            nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                                sso,
-                                log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
-                            )
-                            nsfw_status = "成功" if nsfw_ok else f"失败: {nsfw_msg}"
-                        else:
-                            nsfw_status = "未开启"
-                        line = f"{email}----{profile.get('password','')}----{sso}\n"
+                        line = f"{email}----{profile.get('password','')}\n"
                         try:
                             with accounts_lock:
                                 # 以邮箱命名单独保存
-                                email_file = account_file_for_email(email)
+                                email_file = flow_account_file(email)
                                 with open(email_file, "w", encoding="utf-8") as f:
                                     f.write(line)
                         except Exception as file_exc:
                             registration_log(
                                 f"[W{wid+1}] [!] 保存账号文件失败，当前账号不计为成功: {file_exc}"
                             )
-                            _append_sso_pending(
+                            raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
+                        email_disable_detail = (
+                            disable_outlookemail_after_registration_success(
                                 email,
-                                sso,
                                 log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
                             )
-                            raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
-                        cpa_ok = add_sso_to_cpa(
-                            sso,
-                            email=email,
-                            log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
-                            result_out=cpa_detail,
+                            if is_outlookemail_registration()
+                            else default_email_disable_detail("")
                         )
-                        if not registration_counts_as_success(cpa_detail):
-                            reason = cpa_failure_reason(cpa_detail)
-                            local_fail_stats[FAIL_CPA] = local_fail_stats.get(FAIL_CPA, 0) + 1
-                            local_fail += 1
-                            i += 1
-                            retry = 0
-                            # xAI 侧账号通常已创建，按自动停用开关尝试停用 Outlook 邮箱，避免下次再取到同一邮箱。
-                            email_disable_detail = (
-                                disable_outlookemail_consumed(
-                                    email,
-                                    reason=f"CPA失败但已保存SSO: {reason}",
-                                    log_callback=lambda m: registration_log(f"[W{wid+1}] {m}")
-                                )
-                                if is_outlookemail_registration()
-                                else default_email_disable_detail("", cpa_detail)
-                            )
-                            _persist_result(
-                                started_at=attempt_started_at,
-                                worker_id=wid,
-                                email=email,
-                                password=current_attempt_password(profile),
-                                status="failure",
-                                cpa_detail=cpa_detail,
-                                email_disable_detail=email_disable_detail,
-                                failure_type=FAIL_CPA,
-                                failure_reason=reason,
-                                account_file=email_file,
-                                sso_saved=True,
-                                nsfw_status=nsfw_status,
-                                extra={"任务序号": i, "并发数": workers},
-                            )
-                            registration_log(
-                                f"[W{wid+1}] [-] 注册未计成功 [CPA失败]: {reason}"
-                            )
-                        else:
-                            email_disable_detail = (
-                                disable_outlookemail_after_cpa_success(
-                                    email,
-                                    cpa_detail,
-                                    log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
-                                )
-                                if is_outlookemail_registration()
-                                else default_email_disable_detail("", cpa_detail)
-                            )
-                            local_success += 1
-                            i += 1
-                            retry = 0
-                            if cpa_ok:
-                                registration_log(f"[W{wid+1}] [+] 注册成功: {email}")
-                            else:
-                                registration_log(f"[W{wid+1}] [+] 注册成功（SSO 已保存，CPA 入库失败）: {email}")
-                            _persist_result(
-                                started_at=attempt_started_at,
-                                worker_id=wid,
-                                email=email,
-                                password=current_attempt_password(profile),
-                                status="success",
-                                cpa_detail=cpa_detail,
-                                email_disable_detail=email_disable_detail,
-                                account_file=email_file,
-                                sso_saved=True,
-                                nsfw_status=nsfw_status,
-                                extra={"任务序号": i, "并发数": workers},
-                            )
+                        local_success += 1
+                        i += 1
+                        retry = 0
+                        registration_log(f"[W{wid+1}] [+] 注册成功: {email}")
+                        _persist_result(
+                            started_at=attempt_started_at,
+                            worker_id=wid,
+                            email=email,
+                            password=_attempt_password(profile),
+                            status="success",
+                            email_disable_detail=email_disable_detail,
+                            account_file=email_file,
+                            extra={"任务序号": i, "并发数": workers},
+                        )
                     except RegistrationCancelled:
-                        cancelled_email = current_attempt_email(email)
+                        cancelled_email = _attempt_email(email)
                         if cancelled_email:
                             _persist_result(
                                 started_at=attempt_started_at,
                                 worker_id=wid,
                                 email=cancelled_email,
-                                password=current_attempt_password(profile),
+                                password=_attempt_password(profile),
                                 status="cancelled",
-                                cpa_detail=cpa_detail,
                                 failure_reason="用户停止注册",
                                 account_file=email_file,
-                                sso_saved=bool(email_file),
-                                nsfw_status=nsfw_status,
                             )
                         break
                     except EmailDomainRejected as exc:
-                        kind = classify_failure(exc)
+                        kind = _classify(exc)
                         local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
                         local_fail += 1
                         i += 1
@@ -3313,20 +1997,18 @@ def run_registration(count):
                         _persist_result(
                             started_at=attempt_started_at,
                             worker_id=wid,
-                            email=current_attempt_email(email, exc),
-                            password=current_attempt_password(profile),
+                            email=_attempt_email(email, exc),
+                            password=_attempt_password(profile),
                             status="failure",
-                            cpa_detail=cpa_detail,
                             failure_type=kind,
                             failure_reason=str(exc),
-                            nsfw_status=nsfw_status,
                         )
                         registration_log(f"[W{wid+1}] [-] 域名拒绝: {exc}")
                     except AccountRetryNeeded as exc:
                         retry += 1
                         if retry > max_slot_retry:
                             retry_used = retry
-                            kind = classify_failure(exc)
+                            kind = _classify(exc)
                             local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
                             local_fail += 1
                             i += 1
@@ -3334,53 +2016,40 @@ def run_registration(count):
                             _persist_result(
                                 started_at=attempt_started_at,
                                 worker_id=wid,
-                                email=current_attempt_email(email, exc),
-                                password=current_attempt_password(profile),
+                                email=_attempt_email(email, exc),
+                                password=_attempt_password(profile),
                                 status="failure",
-                                cpa_detail=cpa_detail,
                                 failure_type=kind,
                                 failure_reason=str(exc),
                                 account_file=email_file,
-                                sso_saved=bool(email_file),
-                                nsfw_status=nsfw_status,
                                 extra={"重试次数": retry_used},
                             )
                             registration_log(f"[W{wid+1}] [-] 卡住跳过: {exc}")
                     except Exception as exc:
-                        kind = classify_failure(exc)
+                        kind = _classify(exc)
                         local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
                         local_fail += 1
                         i += 1
                         retry = 0
-                        if kind == FAIL_RISK:
-                            mark_registration_risk(
-                                cpa_detail,
-                                exc,
-                                email=current_attempt_email(email, exc),
-                                log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
-                            )
-                        fail_email = current_attempt_email(email, exc)
+                        fail_email = _attempt_email(email, exc)
                         email_disable_detail = maybe_disable_outlookemail_for_consumed_failure(
                             kind,
                             fail_email,
-                            reason=f"{FAIL_LABELS.get(kind, kind)}: {exc}",
+                            reason=f"{failure_labels.get(kind, kind)}: {exc}",
                             log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
                         )
                         _persist_result(
                             started_at=attempt_started_at,
                             worker_id=wid,
                             email=fail_email,
-                            password=current_attempt_password(profile),
+                            password=_attempt_password(profile),
                             status="failure",
-                            cpa_detail=cpa_detail,
                             email_disable_detail=email_disable_detail,
                             failure_type=kind,
                             failure_reason=str(exc),
                             account_file=email_file,
-                            sso_saved=bool(email_file) or bool(sso and kind == FAIL_RISK),
-                            nsfw_status=nsfw_status,
                         )
-                        registration_log(f"[W{wid+1}] [-] 失败 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
+                        registration_log(f"[W{wid+1}] [-] 失败 [{failure_labels.get(kind, kind)}]: {exc}")
                     finally:
                         if i < n and not controller.should_stop():
                             try:
@@ -3415,7 +2084,7 @@ def run_registration(count):
         fail_stats = shared["fail_stats"]
         registration_log(
             f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}"
-            + (f" | {format_fail_stats(fail_stats)}" if fail_count else "")
+            + (f" | {format_fail_stats(fail_stats, failure_labels)}" if fail_count else "")
         )
         return
 
@@ -3436,10 +2105,6 @@ def run_registration(count):
                     status="failure",
                     failure_type=FAIL_BROWSER,
                     failure_reason=str(boot_exc),
-                    cpa_detail={
-                        "enabled": bool(config.get("cpa_auto_add", False)),
-                        "status": "not_attempted" if config.get("cpa_auto_add") else "disabled",
-                    },
                 )
             return
         registration_log("[*] 浏览器已启动")
@@ -3451,13 +2116,7 @@ def run_registration(count):
             attempt_started_at = time.time()
             email = ""
             profile = {}
-            sso = ""
             email_file = ""
-            cpa_detail = {
-                "enabled": bool(config.get("cpa_auto_add", False)),
-                "status": "not_attempted" if config.get("cpa_auto_add") else "disabled",
-            }
-            nsfw_status = "未执行"
             try:
                 dev_token = ""
                 code = ""
@@ -3466,27 +2125,18 @@ def run_registration(count):
                 for mail_try in range(1, max_mail_retry + 1):
                     mail_attempt_started_at = time.time()
                     registration_log(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
-                    open_signup_page(
+                    flow_open_signup_page(
                         log_callback=registration_log, cancel_callback=controller.should_stop
                     )
                     registration_log("[*] 2. 创建邮箱并提交")
-                    email, dev_token, submitted_at = fill_email_and_submit(
+                    email, dev_token, submitted_at = flow_fill_email_and_submit(
                         log_callback=registration_log, cancel_callback=controller.should_stop
                     )
                     registration_log(f"[*] 邮箱: {email}")
-                    registration_log(f"[Debug] 邮箱 token 已获取 (len={len(str(dev_token or ''))})")
-                    try:
-                        with open(
-                            accounts_side_file("mail_credentials.txt"),
-                            "a",
-                            encoding="utf-8",
-                        ) as f:
-                            f.write(f"{email}\t{dev_token}\n")
-                    except Exception:
-                        pass
+                    registration_log("[Debug] 邮箱验证码会话已建立")
                     registration_log("[*] 3. 拉取验证码")
                     try:
-                        code = fill_code_and_submit(
+                        code = flow_fill_code_and_submit(
                             email,
                             dev_token,
                             submitted_at=submitted_at,
@@ -3502,8 +2152,7 @@ def run_registration(count):
                                 started_at=mail_attempt_started_at,
                                 email=email,
                                 status="failure",
-                                cpa_detail=cpa_detail,
-                                failure_type=classify_failure(mail_exc),
+                                failure_type=_classify(mail_exc),
                                 failure_reason=str(mail_exc),
                                 extra={"邮箱已更换重试": True, "邮箱尝试次数": mail_try},
                             )
@@ -3517,107 +2166,44 @@ def run_registration(count):
                     raise Exception("验证码阶段失败，已达到最大重试次数")
                 registration_log(f"[*] 验证码: {code}")
                 registration_log("[*] 4. 填写资料")
-                profile = fill_profile_and_submit(
+                profile = flow_fill_profile_and_submit(
                     log_callback=registration_log, cancel_callback=controller.should_stop
                 )
                 registration_log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
-                registration_log("[*] 5. 等待 sso cookie")
-                sso = wait_for_sso_cookie(
+                registration_log("[*] 5. 确认注册完成")
+                flow_wait_for_completion(
                     log_callback=registration_log, cancel_callback=controller.should_stop
                 )
-                ensure_sso_oauth_eligible(
-                    sso,
-                    email=email,
-                    log_callback=registration_log,
-                    result_out=cpa_detail,
-                )
-                if config.get("enable_nsfw", True):
-                    registration_log("[*] 6. 开启 NSFW")
-                    nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                        sso, log_callback=registration_log
-                    )
-                    if nsfw_ok:
-                        nsfw_status = "成功"
-                        registration_log(f"[+] NSFW 开启成功: {nsfw_msg}")
-                    else:
-                        nsfw_status = f"失败: {nsfw_msg}"
-                        registration_log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
-                else:
-                    nsfw_status = "未开启"
                 try:
-                    line = f"{email}----{profile.get('password','')}----{sso}\n"
+                    line = f"{email}----{profile.get('password','')}\n"
                     # 以邮箱命名单独保存
-                    email_file = account_file_for_email(email)
+                    email_file = flow_account_file(email)
                     with open(email_file, "w", encoding="utf-8") as f:
                         f.write(line)
                 except Exception as file_exc:
                     registration_log(f"[!] 保存账号文件失败，当前账号不计为成功: {file_exc}")
-                    _append_sso_pending(email, sso, log_callback=registration_log)
                     raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
-                cpa_ok = add_sso_to_cpa(
-                    sso,
-                    email=email,
-                    log_callback=registration_log,
-                    result_out=cpa_detail,
+                email_disable_detail = (
+                    disable_outlookemail_after_registration_success(
+                        email, log_callback=registration_log
+                    )
+                    if is_outlookemail_registration()
+                    else default_email_disable_detail("")
                 )
-                counted_success = False
-                if not registration_counts_as_success(cpa_detail):
-                    reason = cpa_failure_reason(cpa_detail)
-                    _record_failure(RuntimeError(f"[CPA] {reason}"))
-                    retry_count_for_slot = 0
-                    i += 1
-                    email_disable_detail = (
-                        disable_outlookemail_consumed(
-                            email,
-                            reason=f"CPA失败但已保存SSO: {reason}",
-                            log_callback=registration_log
-                        )
-                        if is_outlookemail_registration()
-                        else default_email_disable_detail("", cpa_detail)
-                    )
-                    _persist_result(
-                        started_at=attempt_started_at,
-                        email=email,
-                        password=current_attempt_password(profile),
-                        status="failure",
-                        cpa_detail=cpa_detail,
-                        email_disable_detail=email_disable_detail,
-                        failure_type=FAIL_CPA,
-                        failure_reason=reason,
-                        account_file=email_file,
-                        sso_saved=True,
-                        nsfw_status=nsfw_status,
-                        extra={"任务序号": i, "并发数": 1},
-                    )
-                    registration_log(f"[-] 注册未计成功 [CPA失败]: {reason}")
-                else:
-                    email_disable_detail = (
-                        disable_outlookemail_after_cpa_success(
-                            email, cpa_detail, log_callback=registration_log
-                        )
-                        if is_outlookemail_registration()
-                        else default_email_disable_detail("", cpa_detail)
-                    )
-                    success_count += 1
-                    counted_success = True
-                    retry_count_for_slot = 0
-                    i += 1
-                    if cpa_ok:
-                        registration_log(f"[+] 注册成功: {email}")
-                    else:
-                        registration_log(f"[+] 注册成功（SSO 已保存，CPA 入库失败）: {email}")
-                    _persist_result(
-                        started_at=attempt_started_at,
-                        email=email,
-                        password=current_attempt_password(profile),
-                        status="success",
-                        cpa_detail=cpa_detail,
-                        email_disable_detail=email_disable_detail,
-                        account_file=email_file,
-                        sso_saved=True,
-                        nsfw_status=nsfw_status,
-                        extra={"任务序号": i, "并发数": 1},
-                    )
+                success_count += 1
+                counted_success = True
+                retry_count_for_slot = 0
+                i += 1
+                registration_log(f"[+] 注册成功: {email}")
+                _persist_result(
+                    started_at=attempt_started_at,
+                    email=email,
+                    password=_attempt_password(profile),
+                    status="success",
+                    email_disable_detail=email_disable_detail,
+                    account_file=email_file,
+                    extra={"任务序号": i, "并发数": 1},
+                )
                 registration_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
                 if (
                     counted_success
@@ -3630,18 +2216,15 @@ def run_registration(count):
                         reason=f"已成功 {success_count} 个账号，执行定期清理",
                     )
             except RegistrationCancelled:
-                cancelled_email = current_attempt_email(email)
+                cancelled_email = _attempt_email(email)
                 if cancelled_email:
                     _persist_result(
                         started_at=attempt_started_at,
                         email=cancelled_email,
-                        password=current_attempt_password(profile),
+                        password=_attempt_password(profile),
                         status="cancelled",
-                        cpa_detail=cpa_detail,
                         failure_reason="用户停止注册",
                         account_file=email_file,
-                        sso_saved=bool(email_file),
-                        nsfw_status=nsfw_status,
                     )
                 registration_log("[!] 注册被停止")
                 break
@@ -3651,15 +2234,13 @@ def run_registration(count):
                 i += 1
                 _persist_result(
                     started_at=attempt_started_at,
-                    email=current_attempt_email(email, exc),
-                    password=current_attempt_password(profile),
+                    email=_attempt_email(email, exc),
+                    password=_attempt_password(profile),
                     status="failure",
-                    cpa_detail=cpa_detail,
                     failure_type=kind,
                     failure_reason=str(exc),
-                    nsfw_status=nsfw_status,
                 )
-                registration_log(f"[-] 邮箱域名被 xAI 拒绝 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
+                registration_log(f"[-] 邮箱域名被 {target_label} 拒绝 [{failure_labels.get(kind, kind)}]: {exc}")
                 registration_log("[!] 请更换邮箱提供商或域名（如 Cloudflare 自建域 / MailNest），公共临时域常被拉黑")
             except AccountRetryNeeded as exc:
                 retry_count_for_slot += 1
@@ -3674,58 +2255,41 @@ def run_registration(count):
                     i += 1
                     _persist_result(
                         started_at=attempt_started_at,
-                        email=current_attempt_email(email, exc),
-                        password=current_attempt_password(profile),
+                        email=_attempt_email(email, exc),
+                        password=_attempt_password(profile),
                         status="failure",
-                        cpa_detail=cpa_detail,
                         failure_type=kind,
                         failure_reason=str(exc),
                         account_file=email_file,
-                        sso_saved=bool(email_file),
-                        nsfw_status=nsfw_status,
                         extra={"重试次数": retry_used},
                     )
-                    registration_log(f"[-] 当前账号已达到最大重试次数，跳过 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
+                    registration_log(f"[-] 当前账号已达到最大重试次数，跳过 [{failure_labels.get(kind, kind)}]: {exc}")
             except Exception as exc:
                 kind = _record_failure(exc)
                 retry_count_for_slot = 0
                 i += 1
-                if kind == FAIL_RISK:
-                    mark_registration_risk(
-                        cpa_detail,
-                        exc,
-                        email=current_attempt_email(email, exc),
-                        log_callback=registration_log,
-                    )
-                fail_email = current_attempt_email(email, exc)
+                fail_email = _attempt_email(email, exc)
                 email_disable_detail = maybe_disable_outlookemail_for_consumed_failure(
                     kind,
                     fail_email,
-                    reason=f"{FAIL_LABELS.get(kind, kind)}: {exc}",
+                    reason=f"{failure_labels.get(kind, kind)}: {exc}",
                     log_callback=registration_log,
                 )
                 _persist_result(
                     started_at=attempt_started_at,
                     email=fail_email,
-                    password=current_attempt_password(profile),
+                    password=_attempt_password(profile),
                     status="failure",
-                    cpa_detail=cpa_detail,
                     email_disable_detail=email_disable_detail,
                     failure_type=kind,
                     failure_reason=str(exc),
                     account_file=email_file,
-                    sso_saved=bool(email_file) or bool(sso and kind == FAIL_RISK),
-                    nsfw_status=nsfw_status,
                 )
-                registration_log(f"[-] 注册失败 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
-            finally:
-                if controller.should_stop():
-                    break
-                # 每轮结束只关浏览器，不立刻再开。
-                # 下一轮 open_signup_page 会按需启动并导航到官网，避免空浏览器残留。
-                if i >= count:
-                    continue
-                # 账号间随机间隔
+                registration_log(f"[-] 注册失败 [{failure_labels.get(kind, kind)}]: {exc}")
+            if controller.should_stop():
+                break
+            # 每轮结束只关浏览器；下一轮按需重新启动并导航到官网。
+            if i < count:
                 wait_sec = parse_account_interval()
                 if wait_sec > 0:
                     registration_log(f"[*] 下一个账号前等待 {wait_sec:.0f} 秒...")
@@ -3755,7 +2319,7 @@ def run_registration(count):
         try:
             registration_log(
                 f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}"
-                + (f" | {format_fail_stats(fail_stats)}" if fail_count else "")
+                + (f" | {format_fail_stats(fail_stats, failure_labels)}" if fail_count else "")
             )
         except BaseException:
             pass

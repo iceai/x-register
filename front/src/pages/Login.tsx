@@ -30,11 +30,11 @@ export function LoginPage({ setupRequired, onLoggedIn }: { setupRequired: boolea
       <section className="hidden flex-col justify-between border-r border-slate-200 bg-slate-900 p-10 text-white lg:flex xl:p-14">
         <div className="flex items-center gap-3">
           <span className="flex h-10 w-10 items-center justify-center rounded-lg bg-white text-sm font-bold text-slate-900">GR</span>
-          <div><div className="font-semibold">Grok Register</div><div className="text-xs text-slate-400">账号与授权控制台</div></div>
+          <div><div className="font-semibold">X Register</div><div className="text-xs text-slate-400">账号注册管理系统</div></div>
         </div>
         <div className="max-w-md">
           <p className="text-sm font-medium text-sky-300">LOCAL OPERATIONS</p>
-          <h1 className="mt-4 text-4xl font-semibold leading-tight tracking-tight">把注册、账号和授权文件放在一个清晰的工作台。</h1>
+          <h1 className="mt-4 text-4xl font-semibold leading-tight tracking-tight">把注册任务、账号结果和系统配置放在一个清晰的工作台。</h1>
           <div className="mt-8 space-y-4 text-sm text-slate-300">
             {["注册任务与运行日志独立管理", "账号、重登与历史报告清晰隔离", "服务配置和实际文件随时核对"].map((item) => <div key={item} className="flex items-center gap-3"><span className="flex h-5 w-5 items-center justify-center rounded-full bg-sky-600/30 text-sky-200"><Check className="h-3 w-3" /></span>{item}</div>)}
           </div>
@@ -45,7 +45,7 @@ export function LoginPage({ setupRequired, onLoggedIn }: { setupRequired: boolea
       <section className="flex items-center justify-center px-4 py-8 sm:px-8">
         <form onSubmit={submit} className="w-full max-w-[440px] rounded-2xl border border-slate-200 bg-white p-5 shadow-[0_18px_50px_-35px_rgba(15,23,42,.4)] sm:p-8">
           <div className="mb-8 lg:hidden">
-            <div className="flex items-center gap-3"><span className="flex h-10 w-10 items-center justify-center rounded-lg bg-slate-900 text-sm font-bold text-white">GR</span><div><div className="font-semibold text-slate-950">Grok Register</div><div className="text-xs text-slate-500">账号与授权控制台</div></div></div>
+            <div className="flex items-center gap-3"><span className="flex h-10 w-10 items-center justify-center rounded-lg bg-slate-900 text-sm font-bold text-white">XR</span><div><div className="font-semibold text-slate-950">X Register</div><div className="text-xs text-slate-500">账号注册管理系统</div></div></div>
           </div>
           <div className="mb-7">
             <p className="text-xs font-medium uppercase tracking-[.12em] text-sky-600">Administrator</p>

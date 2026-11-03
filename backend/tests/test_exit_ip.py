@@ -42,8 +42,8 @@ class FlaggedExitIpStoreTests(unittest.TestCase):
                 store.remember_flagged_exit_ip(
                     "203.0.113.8",
                     email="risk@example.com",
-                    bot_flag_source=1,
-                    failure_reason="botFlagSource=1",
+                    risk_source=1,
+                    failure_reason="risk source 1",
                 )
             )
             self.assertTrue(store.is_flagged_exit_ip("203.0.113.8"))
@@ -64,7 +64,7 @@ class FlaggedExitIpStoreTests(unittest.TestCase):
                         "SELECT name FROM sqlite_master WHERE type = 'table'"
                     )
                 }
-            self.assertEqual(version, 8)
+            self.assertEqual(version, 9)
             self.assertIn("flagged_exit_ips", tables)
 
     def test_lists_and_deletes_flagged_exit_ips(self):
@@ -74,8 +74,8 @@ class FlaggedExitIpStoreTests(unittest.TestCase):
                 store.remember_flagged_exit_ip(
                     "203.0.113.8",
                     email="first@example.com",
-                    bot_flag_source=1,
-                    failure_reason="botFlagSource=1",
+                    risk_source=1,
+                    failure_reason="risk source 1",
                 )
             )
             self.assertTrue(
@@ -89,7 +89,7 @@ class FlaggedExitIpStoreTests(unittest.TestCase):
             self.assertEqual(set(by_ip), {"203.0.113.8", "2606:4700:4700::1111"})
             self.assertEqual(by_ip["203.0.113.8"]["last_email"], "first@example.com")
             self.assertEqual(by_ip["203.0.113.8"]["hit_count"], 1)
-            self.assertEqual(by_ip["203.0.113.8"]["last_bot_flag_source"], "1")
+            self.assertEqual(by_ip["203.0.113.8"]["last_risk_source"], "1")
             self.assertTrue(store.delete_flagged_exit_ip(" 203.0.113.8 "))
             self.assertFalse(store.is_flagged_exit_ip("203.0.113.8"))
             self.assertFalse(store.delete_flagged_exit_ip("203.0.113.8"))
@@ -206,81 +206,6 @@ class EnsureUnflaggedExitIpTests(unittest.TestCase):
         )
         self.assertEqual(ip, "203.0.113.9")
         restart.assert_not_called()
-
-
-class RegistrationRiskExitIpTests(unittest.TestCase):
-    def setUp(self):
-        exit_ip.set_current_exit_ip("198.51.100.23")
-        self.original = dict(engine.config)
-
-    def tearDown(self):
-        exit_ip.set_current_exit_ip("")
-        engine.config.clear()
-        engine.config.update(self.original)
-
-    def test_remembers_flagged_ip_on_bot_risk(self):
-        store = mock.Mock()
-        store.remember_flagged_exit_ip.return_value = True
-        logs = []
-        exc = engine.RegistrationRiskDenied(
-            "注册风控拒绝，已跳过 OAuth: botFlagSource=1",
-            bot_risk=True,
-            bot_flag_source=1,
-        )
-        with (
-            mock.patch.object(engine, "get_registration_repository", return_value=store),
-            mock.patch.object(
-                engine._exit_ip,
-                "refresh_browser_exit_ip",
-                return_value="198.51.100.23",
-            ),
-        ):
-            saved = engine.remember_registration_risk_exit_ip(
-                exc, email="risk@example.com", log_callback=logs.append
-            )
-        self.assertTrue(saved)
-        store.remember_flagged_exit_ip.assert_called_once()
-        kwargs = store.remember_flagged_exit_ip.call_args
-        self.assertEqual(kwargs.args[0], "198.51.100.23")
-        self.assertEqual(kwargs.kwargs["email"], "risk@example.com")
-        self.assertTrue(any("已记录出口 IP 198.51.100.23" in item for item in logs))
-
-    def test_remembers_exit_ip_detected_at_risk_time(self):
-        exit_ip.set_current_exit_ip("198.51.100.23", as_start=True)
-        store = mock.Mock()
-        store.remember_flagged_exit_ip.return_value = True
-        logs = []
-        exc = engine.RegistrationRiskDenied(
-            "注册风控拒绝，已跳过 OAuth: botFlagSource=1",
-            bot_risk=True,
-            bot_flag_source=1,
-        )
-        with (
-            mock.patch.object(engine, "get_registration_repository", return_value=store),
-            mock.patch.object(
-                engine._exit_ip,
-                "refresh_browser_exit_ip",
-                return_value="203.0.113.77",
-            ),
-        ):
-            saved = engine.remember_registration_risk_exit_ip(
-                exc, email="risk@example.com", log_callback=logs.append
-            )
-        self.assertTrue(saved)
-        self.assertEqual(
-            store.remember_flagged_exit_ip.call_args.args[0], "203.0.113.77"
-        )
-        self.assertTrue(
-            any("203.0.113.77（打开注册页时是 198.51.100.23）" in item for item in logs)
-        )
-
-    def test_skips_remember_when_not_bot_risk(self):
-        store = mock.Mock()
-        exc = engine.RegistrationRiskDenied("注册风控检查失败: sso 为空")
-        with mock.patch.object(engine, "get_registration_repository", return_value=store):
-            saved = engine.remember_registration_risk_exit_ip(exc, email="a@b.c")
-        self.assertFalse(saved)
-        store.remember_flagged_exit_ip.assert_not_called()
 
 
 class OpenSignupPageExitIpTests(unittest.TestCase):
