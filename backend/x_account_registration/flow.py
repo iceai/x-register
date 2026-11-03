@@ -403,6 +403,7 @@ def _find_exact_text_button(page: Any, labels: Iterable[str]) -> Any | None:
     }
     if not expected:
         return None
+    matches: list[tuple[bool, Any]] = []
     for _scope_label, scope in _iter_page_scopes(page):
         try:
             buttons = scope.locator("button, [role='button'], a, [role='link']")
@@ -425,10 +426,21 @@ def _find_exact_text_button(page: Any, labels: Iterable[str]) -> Any | None:
                     r"\s+", " ", str(candidate.inner_text(timeout=500) or "")
                 ).strip().casefold()
                 if rendered_text in expected:
-                    return candidate
+                    try:
+                        in_dialog = bool(
+                            candidate.evaluate(
+                                "element => Boolean(element.closest(\"[role='dialog']\"))"
+                            )
+                        )
+                    except Exception:
+                        in_dialog = False
+                    matches.append((in_dialog, candidate))
             except Exception:
                 continue
-    return None
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item[0], reverse=True)
+    return matches[0][1]
 
 
 def _click_exact_action(
