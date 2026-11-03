@@ -403,10 +403,8 @@ def _find_exact_text_button(page: Any, labels: Iterable[str]) -> Any | None:
         return None
     for _scope_label, scope in _iter_page_scopes(page):
         try:
-            buttons = scope.locator(
-                "button, [role='button'], a, [role='link'], [tabindex='0']"
-            )
-            button_count = min(int(buttons.count()), 60)
+            buttons = scope.locator("button, [role='button'], a, [role='link']")
+            button_count = min(int(buttons.count()), 30)
         except Exception:
             continue
         for index in range(button_count):
@@ -443,43 +441,43 @@ def _click_exact_action(
     if action is not None:
         action.click(timeout=10_000)
         return True
-    for label in labels:
-        label_text = str(label or "").strip()
-        if not label_text:
+    expected = [
+        re.sub(r"\s+", " ", str(label or "")).strip().casefold()
+        for label in labels
+        if str(label or "").strip()
+    ]
+    for _scope_label, scope in _iter_page_scopes(page):
+        try:
+            clicked = scope.evaluate(
+                """expected => {
+                    const normalize = value => String(value || '')
+                        .replace(/\\s+/g, ' ').trim().toLocaleLowerCase();
+                    const allowed = new Set(expected);
+                    const controls = document.querySelectorAll(
+                        "button, [role='button'], a, [role='link'], [tabindex='0']"
+                    );
+                    for (const target of controls) {
+                        const style = getComputedStyle(target);
+                        const rect = target.getBoundingClientRect();
+                        const visible = style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && Number(style.opacity || 0) > 0.01
+                            && rect.width > 0 && rect.height > 0;
+                        if (!visible || !allowed.has(normalize(target.innerText))) continue;
+                        if (target.disabled || target.getAttribute('aria-disabled') === 'true') {
+                            continue;
+                        }
+                        target.click();
+                        return true;
+                    }
+                    return false;
+                }""",
+                expected,
+            )
+            if bool(clicked):
+                return True
+        except Exception:
             continue
-        for _scope_label, scope in _iter_page_scopes(page):
-            try:
-                matches = scope.get_by_text(label_text, exact=True)
-                match_count = min(int(matches.count()), 20)
-            except Exception:
-                continue
-            for index in range(match_count):
-                try:
-                    candidate = matches.nth(index)
-                    if not _visible(candidate):
-                        continue
-                    clicked = candidate.evaluate(
-                        """(element, expected) => {
-                            const normalize = value => String(value || '')
-                                .replace(/\\s+/g, ' ').trim().toLocaleLowerCase();
-                            const target = element.closest(
-                                "button, [role='button'], a, [role='link'], [tabindex='0']"
-                            );
-                            if (!target || normalize(target.innerText) !== normalize(expected)) {
-                                return false;
-                            }
-                            if (target.disabled || target.getAttribute('aria-disabled') === 'true') {
-                                return false;
-                            }
-                            target.click();
-                            return true;
-                        }""",
-                        label_text,
-                    )
-                    if bool(clicked):
-                        return True
-                except Exception:
-                    continue
     return False
 
 
@@ -1027,7 +1025,11 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     email_first_input = None if name_input is not None else _find_email_first_input(page)
 
     if email_first_input is not None:
-        _fill(email_first_input, email)
+        # Match the successful manual flow's paste semantics. Sequential typing
+        # can corrupt the portion before/around '@' under some Camoufox keyboard
+        # layouts, turning an address into a short username such as "he.im".
+        email_first_input.fill(email)
+        time.sleep(0.25)
         log(f"[*] 已创建邮箱并填写 X.com 邮箱优先注册页: {email}")
         verification_requested_at = time.time() - 5
         try:
@@ -1036,6 +1038,13 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
             filled_value = email
         if filled_value.strip() != email:
             email_first_input.fill(email)
+            time.sleep(0.25)
+            try:
+                filled_value = str(email_first_input.input_value() or "")
+            except Exception:
+                filled_value = ""
+        if filled_value.strip() != email:
+            raise XAccountRegistrationError("X.com 邮箱输入值校验失败，已停止提交")
         submitted_from = str(page.url or "")
         _next(page, cancel=cancel)
         log(f"[*] 已点击 X.com 邮箱 Continue，提交页: {_safe_diagnostic_url(submitted_from)}")

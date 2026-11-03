@@ -189,19 +189,9 @@ class XAccountRegistrationTests(unittest.TestCase):
 
     def test_text_fallback_rejects_continue_inside_phone_button(self):
         page = mock.Mock()
-        matches = mock.Mock()
-        phone_text = mock.Mock()
-        standalone_text = mock.Mock()
-        matches.count.return_value = 2
-        matches.nth.side_effect = [phone_text, standalone_text]
-        phone_text.evaluate.return_value = False
-        standalone_text.evaluate.return_value = True
-        page.get_by_text.return_value = matches
+        page.evaluate.return_value = True
 
-        with (
-            mock.patch.object(flow, "_find_exact_text_button", return_value=None),
-            mock.patch.object(flow, "_visible", return_value=True),
-        ):
+        with mock.patch.object(flow, "_find_exact_text_button", return_value=None):
             clicked = flow._click_exact_action(
                 page,
                 ("Continue",),
@@ -209,12 +199,14 @@ class XAccountRegistrationTests(unittest.TestCase):
             )
 
         self.assertTrue(clicked)
-        phone_text.evaluate.assert_called_once()
-        standalone_text.evaluate.assert_called_once()
+        expression, expected = page.evaluate.call_args.args
+        self.assertIn("allowed.has(normalize(target.innerText))", expression)
+        self.assertEqual(expected, ["continue"])
 
     def test_email_first_variant_submits_email_before_profile(self):
         page = mock.Mock()
         email_input = mock.Mock()
+        email_input.input_value.return_value = "person@example.com"
         log = mock.Mock()
         cancel = mock.Mock(return_value=False)
 
@@ -234,9 +226,9 @@ class XAccountRegistrationTests(unittest.TestCase):
                 flow, "_find", return_value=None
             ),
             mock.patch.object(flow, "_find_email_first_input", return_value=email_input),
-            mock.patch.object(flow, "_fill") as fill,
             mock.patch.object(flow, "_next", return_value=True) as next_step,
             mock.patch.object(flow, "_wait_for_email_verification_step") as wait_step,
+            mock.patch.object(flow.time, "sleep"),
         ):
             email, token, _submitted_at = flow.fill_email_and_submit(
                 log_callback=log,
@@ -244,7 +236,7 @@ class XAccountRegistrationTests(unittest.TestCase):
             )
 
         self.assertEqual((email, token), ("person@example.com", "mail-token"))
-        fill.assert_called_once_with(email_input, "person@example.com")
+        email_input.fill.assert_called_once_with("person@example.com")
         next_step.assert_called_once_with(page, cancel=cancel)
         wait_step.assert_called_once()
         self.assertEqual(wait_step.call_args.args[1], "person@example.com")
