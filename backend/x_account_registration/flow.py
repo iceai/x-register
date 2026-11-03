@@ -403,8 +403,10 @@ def _find_exact_text_button(page: Any, labels: Iterable[str]) -> Any | None:
         return None
     for _scope_label, scope in _iter_page_scopes(page):
         try:
-            buttons = scope.locator("button, [role='button']")
-            button_count = min(int(buttons.count()), 30)
+            buttons = scope.locator(
+                "button, [role='button'], a, [role='link'], [tabindex='0']"
+            )
+            button_count = min(int(buttons.count()), 60)
         except Exception:
             continue
         for index in range(button_count):
@@ -447,13 +449,37 @@ def _click_exact_action(
             continue
         for _scope_label, scope in _iter_page_scopes(page):
             try:
-                candidate = scope.get_by_text(label_text, exact=True)
-                if not _visible(candidate):
-                    continue
-                candidate.first.click(timeout=10_000)
-                return True
+                matches = scope.get_by_text(label_text, exact=True)
+                match_count = min(int(matches.count()), 20)
             except Exception:
                 continue
+            for index in range(match_count):
+                try:
+                    candidate = matches.nth(index)
+                    if not _visible(candidate):
+                        continue
+                    clicked = candidate.evaluate(
+                        """(element, expected) => {
+                            const normalize = value => String(value || '')
+                                .replace(/\\s+/g, ' ').trim().toLocaleLowerCase();
+                            const target = element.closest(
+                                "button, [role='button'], a, [role='link'], [tabindex='0']"
+                            );
+                            if (!target || normalize(target.innerText) !== normalize(expected)) {
+                                return false;
+                            }
+                            if (target.disabled || target.getAttribute('aria-disabled') === 'true') {
+                                return false;
+                            }
+                            target.click();
+                            return true;
+                        }""",
+                        label_text,
+                    )
+                    if bool(clicked):
+                        return True
+                except Exception:
+                    continue
     return False
 
 

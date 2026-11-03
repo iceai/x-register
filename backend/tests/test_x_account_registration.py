@@ -187,6 +187,31 @@ class XAccountRegistrationTests(unittest.TestCase):
         exact_button.click.assert_called_once_with(timeout=10_000)
         fallback_click.assert_not_called()
 
+    def test_text_fallback_rejects_continue_inside_phone_button(self):
+        page = mock.Mock()
+        matches = mock.Mock()
+        phone_text = mock.Mock()
+        standalone_text = mock.Mock()
+        matches.count.return_value = 2
+        matches.nth.side_effect = [phone_text, standalone_text]
+        phone_text.evaluate.return_value = False
+        standalone_text.evaluate.return_value = True
+        page.get_by_text.return_value = matches
+
+        with (
+            mock.patch.object(flow, "_find_exact_text_button", return_value=None),
+            mock.patch.object(flow, "_visible", return_value=True),
+        ):
+            clicked = flow._click_exact_action(
+                page,
+                ("Continue",),
+                cancel=lambda: False,
+            )
+
+        self.assertTrue(clicked)
+        phone_text.evaluate.assert_called_once()
+        standalone_text.evaluate.assert_called_once()
+
     def test_email_first_variant_submits_email_before_profile(self):
         page = mock.Mock()
         email_input = mock.Mock()
