@@ -19,7 +19,10 @@ from backend.registration import engine
 from backend.registration.signup_flow import AccountAlreadyRegistered, build_profile
 
 
-SIGNUP_URL = "https://x.com/i/flow/signup"
+# X's current email-first flow is exposed from the logged-out root page. The
+# legacy /i/flow/signup route can render a visually identical form backed by a
+# different onboarding context that does not advance unknown emails.
+SIGNUP_URL = "https://x.com/"
 DEFAULT_TIMEOUT = 45
 target_label = "X.com"
 result_source = "x_account"
@@ -140,6 +143,32 @@ def _safe_diagnostic_url(value: Any) -> str:
         return _redact_diagnostic_text(f"{origin}{parsed.path}", 220)
     except Exception:
         return _redact_diagnostic_text(raw.split("?", 1)[0].split("#", 1)[0], 220)
+
+
+def _install_onboarding_response_logging(page: Any, log: Callable[[str], None]) -> None:
+    """Log safe status/path details for X onboarding actions used by diagnostics."""
+    if getattr(_runtime, "response_logging_page", None) is page:
+        return
+
+    def on_response(response: Any) -> None:
+        try:
+            raw_url = str(response.url or "")
+            parsed = urlsplit(raw_url)
+            if "/onboarding/web/actions/" not in parsed.path:
+                return
+            method = str(response.request.method or "GET").upper()
+            log(
+                f"[X网络] {method} {_safe_diagnostic_url(raw_url)} "
+                f"-> HTTP {int(response.status)}"
+            )
+        except Exception:
+            pass
+
+    try:
+        page.on("response", on_response)
+        _runtime.response_logging_page = page
+    except Exception:
+        pass
 
 
 def _iter_page_scopes(page: Any) -> list[tuple[str, Any]]:
@@ -683,6 +712,7 @@ def _next(page: Any, *, required: bool = True, cancel: Callable[[], bool]) -> bo
 
 def _prepare_signup_form(page: Any, log: Callable[[str], None], cancel: Callable[[], bool]) -> None:
     page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=45_000)
+    _install_onboarding_response_logging(page, log)
     log("[*] 已打开 X.com 官方注册页")
     if _find(page, NAME_INPUT_SELECTORS) is not None:
         log("[*] 已识别 X.com 资料优先注册页")
@@ -931,8 +961,10 @@ def _wait_for_email_verification_step(
             time.sleep(0.75)
             continue
 
-        # 资料确认/个性化页面的按钮因地区不同可能显示 Sign up 或 Next。
-        if _click(
+        # 旧版资料确认页的按钮可能显示 Sign up。当前统一邮箱入口会直接
+        # 进入验证码页，不应在首屏反复寻找这个不存在的按钮。
+        body_text = _body_text(page).lower()
+        if "sign up" in body_text and _click(
             page,
             (
                 "[data-testid='ocfSignupReviewNextButton']",
@@ -974,7 +1006,15 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
         _fill(email_first_input, email)
         log(f"[*] 已创建邮箱并填写 X.com 邮箱优先注册页: {email}")
         verification_requested_at = time.time() - 5
+        try:
+            filled_value = str(email_first_input.input_value() or "")
+        except Exception:
+            filled_value = email
+        if filled_value.strip() != email:
+            email_first_input.fill(email)
+        submitted_from = str(page.url or "")
         _next(page, cancel=cancel)
+        log(f"[*] 已点击 X.com 邮箱 Continue，提交页: {_safe_diagnostic_url(submitted_from)}")
         _wait_for_email_verification_step(
             page,
             email,
