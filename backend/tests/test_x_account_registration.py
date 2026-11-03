@@ -68,12 +68,34 @@ class XAccountRegistrationTests(unittest.TestCase):
         log.assert_any_call("[*] 已识别 X.com 邮箱优先注册页")
 
     def test_next_uses_exact_continue_selector(self):
-        with mock.patch.object(flow, "_click", return_value=True) as click:
+        with (
+            mock.patch.object(flow, "_find_exact_text_button", return_value=None),
+            mock.patch.object(flow, "_click", return_value=True) as click,
+        ):
             self.assertTrue(flow._next(object(), cancel=lambda: False))
 
         selectors = click.call_args.args[1]
         self.assertIn("button:text-is('Continue')", selectors)
         self.assertNotIn("button:has-text('Continue')", selectors)
+
+    def test_next_clicks_only_exact_rendered_continue_button(self):
+        page = mock.Mock()
+        exact_button = mock.Mock()
+
+        with (
+            mock.patch.object(
+                flow, "_find_exact_text_button", return_value=exact_button
+            ) as find_exact,
+            mock.patch.object(flow, "_click") as fallback_click,
+        ):
+            self.assertTrue(flow._next(page, cancel=lambda: False))
+
+        find_exact.assert_called_once_with(
+            page,
+            ("Continue", "继续", "Next", "下一步"),
+        )
+        exact_button.click.assert_called_once_with(timeout=10_000)
+        fallback_click.assert_not_called()
 
     def test_email_first_variant_submits_email_before_profile(self):
         page = mock.Mock()

@@ -217,6 +217,36 @@ def _find_email_first_input(page: Any) -> Any | None:
     return None
 
 
+def _find_exact_text_button(page: Any, labels: Iterable[str]) -> Any | None:
+    """Find a visible button by its rendered text, including nested-label variants."""
+    expected = {
+        re.sub(r"\s+", " ", str(label or "")).strip().casefold()
+        for label in labels
+        if str(label or "").strip()
+    }
+    if not expected:
+        return None
+    for _scope_label, scope in _iter_page_scopes(page):
+        try:
+            buttons = scope.locator("button, [role='button']")
+            button_count = min(int(buttons.count()), 30)
+        except Exception:
+            continue
+        for index in range(button_count):
+            try:
+                candidate = buttons.nth(index)
+                if not candidate.is_visible():
+                    continue
+                rendered_text = re.sub(
+                    r"\s+", " ", str(candidate.inner_text(timeout=500) or "")
+                ).strip().casefold()
+                if rendered_text in expected:
+                    return candidate
+            except Exception:
+                continue
+    return None
+
+
 def _diagnostic_attr(locator: Any, name: str) -> str:
     try:
         return _redact_diagnostic_text(locator.get_attribute(name) or "-", 90)
@@ -428,6 +458,18 @@ def _set_birthdate(page: Any) -> str:
 
 
 def _next(page: Any, *, required: bool = True, cancel: Callable[[], bool]) -> bool:
+    # X's current onboarding screen renders the Continue label inside nested
+    # elements. Playwright's :text-is() therefore does not match the parent
+    # button, while :has-text('Continue') would also match Continue with phone,
+    # Google and Apple. Resolve the visible button by its exact rendered text.
+    exact_button = _find_exact_text_button(
+        page,
+        ("Continue", "继续", "Next", "下一步"),
+    )
+    if exact_button is not None:
+        _cancelled(cancel)
+        exact_button.click(timeout=10_000)
+        return True
     return _click(
         page,
         (
