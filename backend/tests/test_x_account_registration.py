@@ -51,7 +51,8 @@ class XAccountRegistrationTests(unittest.TestCase):
         cancel = mock.Mock(return_value=False)
 
         with (
-            mock.patch.object(flow, "_find", side_effect=[None, email_input]),
+            mock.patch.object(flow, "_find", return_value=None),
+            mock.patch.object(flow, "_find_email_first_input", return_value=email_input),
             mock.patch.object(flow, "_click") as click,
             mock.patch.object(flow, "_wait_for") as wait_for,
         ):
@@ -93,10 +94,9 @@ class XAccountRegistrationTests(unittest.TestCase):
                 return_value=("Test", "Person", "Strong-password-1"),
             ),
             mock.patch.object(
-                flow,
-                "_find",
-                side_effect=[None, email_input],
+                flow, "_find", return_value=None
             ),
+            mock.patch.object(flow, "_find_email_first_input", return_value=email_input),
             mock.patch.object(flow, "_fill") as fill,
             mock.patch.object(flow, "_next", return_value=True) as next_step,
             mock.patch.object(flow, "_wait_for_email_verification_step") as wait_step,
@@ -111,6 +111,63 @@ class XAccountRegistrationTests(unittest.TestCase):
         next_step.assert_called_once_with(page, cancel=cancel)
         wait_step.assert_called_once()
         self.assertEqual(wait_step.call_args.args[1], "person@example.com")
+
+    def test_find_searches_child_frames(self):
+        page = mock.Mock()
+        main_frame = mock.Mock()
+        child_frame = mock.Mock()
+        page.main_frame = main_frame
+        page.frames = [main_frame, child_frame]
+
+        missing = mock.Mock()
+        missing.count.return_value = 0
+        page.locator.return_value = missing
+        found = mock.Mock()
+        found.count.return_value = 1
+        found.first.is_visible.return_value = True
+        child_frame.locator.return_value = found
+
+        result = flow._find(page, ("input[name='text']",))
+
+        self.assertIs(result, found.first)
+        child_frame.locator.assert_called_once_with("input[name='text']")
+
+    def test_email_first_fallback_uses_accessible_label(self):
+        page = mock.Mock()
+        page.frames = []
+        missing = mock.Mock()
+        missing.count.return_value = 0
+        page.locator.return_value = missing
+        accessible = mock.Mock()
+        accessible.count.return_value = 1
+        accessible.first.is_visible.return_value = True
+        page.get_by_label.return_value = accessible
+
+        result = flow._find_email_first_input(page)
+
+        self.assertIs(result, accessible.first)
+        page.get_by_label.assert_called_once()
+
+    def test_timeout_diagnostics_do_not_log_input_values(self):
+        page = mock.Mock()
+        page.url = "https://x.com/i/flow/signup?token=secret"
+        page.frames = []
+        page.title.return_value = "Sign up"
+        page.evaluate.return_value = "complete"
+        empty = mock.Mock()
+        empty.count.return_value = 0
+        empty.inner_text.return_value = "Email or username person@example.com"
+        page.locator.return_value = empty
+        log = mock.Mock()
+        flow._remember_log_callback(log)
+
+        flow._emit_timeout_diagnostics(page, ("input[name='text']",))
+
+        output = "\n".join(call.args[0] for call in log.call_args_list)
+        self.assertIn("X.com 控件等待超时", output)
+        self.assertIn("<email>", output)
+        self.assertNotIn("person@example.com", output)
+        self.assertNotIn("secret", output)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from urllib.parse import urlsplit
 
 from backend.registration import engine
 from backend.registration.signup_flow import AccountAlreadyRegistered, build_profile
@@ -81,6 +82,67 @@ class PhoneVerificationRequired(XAccountRegistrationError):
     pass
 
 
+def _remember_log_callback(log: Callable[[str], None] | None) -> None:
+    """Keep the current worker logger available to low-level timeout diagnostics."""
+    if callable(log):
+        _runtime.log_callback = log
+
+
+def _runtime_log(message: str) -> None:
+    callback = getattr(_runtime, "log_callback", None)
+    if not callable(callback):
+        return
+    try:
+        callback(message)
+    except Exception:
+        # Diagnostics must never replace the original registration exception.
+        pass
+
+
+def _redact_diagnostic_text(value: Any, limit: int = 320) -> str:
+    """Return a single-line preview without input values, mail addresses or URLs."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(
+        r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+        "<email>",
+        text,
+    )
+    text = re.sub(r"(?i)(token|password|code)=([^&\s]+)", r"\1=<redacted>", text)
+    return text[: max(int(limit), 1)]
+
+
+def _safe_diagnostic_url(value: Any) -> str:
+    """Strip credentials, query strings and fragments from diagnostic URLs."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "<empty>"
+    try:
+        parsed = urlsplit(raw)
+        hostname = parsed.hostname or ""
+        port = f":{parsed.port}" if parsed.port else ""
+        origin = f"{parsed.scheme}://{hostname}{port}" if parsed.scheme else hostname
+        return _redact_diagnostic_text(f"{origin}{parsed.path}", 220)
+    except Exception:
+        return _redact_diagnostic_text(raw.split("?", 1)[0].split("#", 1)[0], 220)
+
+
+def _iter_page_scopes(page: Any) -> list[tuple[str, Any]]:
+    """Search the top-level document and child frames, avoiding the main-frame duplicate."""
+    scopes: list[tuple[str, Any]] = [("page", page)]
+    try:
+        frames = list(page.frames)
+        main_frame = getattr(page, "main_frame", None)
+    except Exception:
+        return scopes
+    child_index = 0
+    for frame in frames:
+        if frame is main_frame:
+            continue
+        child_index += 1
+        scopes.append((f"frame{child_index}", frame))
+    return scopes
+
+
 def _cancelled(cancel: Callable[[], bool] | None) -> None:
     if cancel and cancel():
         raise engine.RegistrationCancelled("用户停止注册")
@@ -95,13 +157,171 @@ def _visible(locator: Any) -> bool:
 
 def _find(page: Any, selectors: Iterable[str]) -> Any | None:
     for selector in selectors:
+        for _scope_label, scope in _iter_page_scopes(page):
+            try:
+                locator = scope.locator(selector)
+                if _visible(locator):
+                    return locator.first
+            except Exception:
+                continue
+    return None
+
+
+def _find_email_first_input(page: Any) -> Any | None:
+    """Locate X's email-first textbox even when attributes or frame placement change."""
+    locator = _find(page, EMAIL_FIRST_INPUT_SELECTORS)
+    if locator is not None:
+        return locator
+
+    label_pattern = re.compile(r"^(email or username|邮箱或用户名)$", re.IGNORECASE)
+    for _scope_label, scope in _iter_page_scopes(page):
+        for method_name, args in (
+            ("get_by_label", (label_pattern,)),
+            ("get_by_role", ("textbox",)),
+        ):
+            try:
+                method = getattr(scope, method_name)
+                candidate = (
+                    method(*args, name=label_pattern)
+                    if method_name == "get_by_role"
+                    else method(*args)
+                )
+                if _visible(candidate):
+                    return candidate.first
+            except Exception:
+                continue
+
+    # Some X variants draw the prompt as adjacent text rather than associating a
+    # label/placeholder with the input. Only use this broad fallback on that exact
+    # email-first screen and never read or log the input's current value.
+    for _scope_label, scope in _iter_page_scopes(page):
         try:
-            locator = page.locator(selector)
-            if _visible(locator):
-                return locator.first
+            body_text = str(scope.locator("body").inner_text(timeout=1000) or "").lower()
+        except Exception:
+            body_text = ""
+        if "email or username" not in body_text and "邮箱或用户名" not in body_text:
+            continue
+        try:
+            inputs = scope.locator("input")
+            input_count = min(int(inputs.count()), 20)
         except Exception:
             continue
+        for index in range(input_count):
+            try:
+                candidate = inputs.nth(index)
+                input_type = str(candidate.get_attribute("type") or "text").lower()
+                if input_type in {"text", "email"} and candidate.is_visible():
+                    return candidate
+            except Exception:
+                continue
     return None
+
+
+def _diagnostic_attr(locator: Any, name: str) -> str:
+    try:
+        return _redact_diagnostic_text(locator.get_attribute(name) or "-", 90)
+    except Exception as exc:
+        return f"<error:{type(exc).__name__}>"
+
+
+def _emit_timeout_diagnostics(page: Any, selectors: Iterable[str]) -> None:
+    """Emit enough safe DOM state to diagnose a changed X screen from Web monitoring."""
+    selector_list = tuple(selectors)
+    try:
+        title = _redact_diagnostic_text(page.title(), 160)
+    except Exception as exc:
+        title = f"<error:{type(exc).__name__}>"
+    try:
+        ready_state = _redact_diagnostic_text(page.evaluate("document.readyState"), 40)
+    except Exception as exc:
+        ready_state = f"<error:{type(exc).__name__}>"
+    _runtime_log(
+        "[诊断] X.com 控件等待超时 | "
+        f"URL={_safe_diagnostic_url(getattr(page, 'url', ''))} | "
+        f"title={title or '<empty>'} | readyState={ready_state}"
+    )
+    _runtime_log("[诊断] 等待的选择器: " + " || ".join(selector_list))
+
+    scopes = _iter_page_scopes(page)
+    frame_details = []
+    for scope_label, scope in scopes:
+        frame_details.append(
+            f"{scope_label}={_safe_diagnostic_url(getattr(scope, 'url', getattr(page, 'url', '')))}"
+        )
+    _runtime_log(f"[诊断] 页面作用域({len(scopes)}): " + " | ".join(frame_details))
+
+    selector_details = []
+    for selector in selector_list:
+        per_scope = []
+        for scope_label, scope in scopes:
+            try:
+                candidate = scope.locator(selector)
+                count = int(candidate.count())
+                visible = bool(count and candidate.first.is_visible())
+                per_scope.append(f"{scope_label}:{count}/visible={str(visible).lower()}")
+            except Exception as exc:
+                per_scope.append(f"{scope_label}:error={type(exc).__name__}:{exc}")
+        selector_details.append(f"{selector} => " + ", ".join(per_scope))
+    for detail in selector_details:
+        _runtime_log("[诊断] 选择器匹配: " + _redact_diagnostic_text(detail, 700))
+
+    input_details = []
+    button_details = []
+    body_preview = ""
+    for scope_label, scope in scopes:
+        try:
+            inputs = scope.locator("input")
+            input_count = min(int(inputs.count()), 20)
+            for index in range(input_count):
+                candidate = inputs.nth(index)
+                try:
+                    visible = bool(candidate.is_visible())
+                except Exception:
+                    visible = False
+                input_details.append(
+                    f"{scope_label}[{index}] visible={str(visible).lower()} "
+                    f"type={_diagnostic_attr(candidate, 'type')} "
+                    f"name={_diagnostic_attr(candidate, 'name')} "
+                    f"aria-label={_diagnostic_attr(candidate, 'aria-label')} "
+                    f"placeholder={_diagnostic_attr(candidate, 'placeholder')} "
+                    f"autocomplete={_diagnostic_attr(candidate, 'autocomplete')} "
+                    f"testid={_diagnostic_attr(candidate, 'data-testid')}"
+                )
+        except Exception as exc:
+            input_details.append(f"{scope_label}:error={type(exc).__name__}:{exc}")
+
+        try:
+            buttons = scope.locator("button, [role='button']")
+            button_count = min(int(buttons.count()), 20)
+            for index in range(button_count):
+                candidate = buttons.nth(index)
+                if not candidate.is_visible():
+                    continue
+                text = _redact_diagnostic_text(candidate.inner_text(timeout=500), 100)
+                button_details.append(
+                    f"{scope_label}[{index}] text={text or '<empty>'} "
+                    f"testid={_diagnostic_attr(candidate, 'data-testid')}"
+                )
+        except Exception as exc:
+            button_details.append(f"{scope_label}:error={type(exc).__name__}:{exc}")
+
+        if not body_preview:
+            try:
+                body_preview = _redact_diagnostic_text(
+                    scope.locator("body").inner_text(timeout=1000), 500
+                )
+            except Exception:
+                pass
+
+    _runtime_log(
+        f"[诊断] 输入框({len(input_details)}): "
+        + (" | ".join(input_details) if input_details else "未发现")
+    )
+    _runtime_log(
+        f"[诊断] 可见按钮({len(button_details)}): "
+        + (" | ".join(button_details) if button_details else "未发现")
+    )
+    _runtime_log(f"[诊断] 页面文本预览: {body_preview or '<empty>'}")
 
 
 def _challenge_reason(page: Any) -> str:
@@ -124,16 +344,22 @@ def _wait_for(
     timeout: float = DEFAULT_TIMEOUT,
     cancel: Callable[[], bool] | None = None,
 ) -> Any:
+    selector_list = tuple(selectors)
     deadline = time.time() + max(float(timeout), 1.0)
     while time.time() < deadline:
         _cancelled(cancel)
         reason = _challenge_reason(page)
         if reason:
             raise ManualChallengeRequired(reason)
-        locator = _find(page, selectors)
+        locator = _find(page, selector_list)
+        if locator is None and any(
+            selector in EMAIL_FIRST_INPUT_SELECTORS for selector in selector_list
+        ):
+            locator = _find_email_first_input(page)
         if locator is not None:
             return locator
         time.sleep(0.25)
+    _emit_timeout_diagnostics(page, selector_list)
     raise XAccountRegistrationError("等待 X.com 注册页面控件超时")
 
 
@@ -230,7 +456,7 @@ def _prepare_signup_form(page: Any, log: Callable[[str], None], cancel: Callable
     if _find(page, NAME_INPUT_SELECTORS) is not None:
         log("[*] 已识别 X.com 资料优先注册页")
         return
-    if _find(page, EMAIL_FIRST_INPUT_SELECTORS) is not None:
+    if _find_email_first_input(page) is not None:
         log("[*] 已识别 X.com 邮箱优先注册页")
         return
 
@@ -245,7 +471,7 @@ def _prepare_signup_form(page: Any, log: Callable[[str], None], cancel: Callable
     if _find(page, NAME_INPUT_SELECTORS) is not None:
         log("[*] 已识别 X.com 资料优先注册页")
         return
-    if _find(page, EMAIL_FIRST_INPUT_SELECTORS) is not None:
+    if _find_email_first_input(page) is not None:
         log("[*] 已识别 X.com 邮箱优先注册页")
         return
 
@@ -303,6 +529,7 @@ blocked_connectivity_message = "X.com 注册页无法访问，已停止建号；
 
 def open_signup_page(log_callback=None, cancel_callback=None) -> None:
     log = log_callback or (lambda _message: None)
+    _remember_log_callback(log)
     cancel = cancel_callback or (lambda: False)
     _cancelled(cancel)
     _runtime.last_email = ""
@@ -310,6 +537,7 @@ def open_signup_page(log_callback=None, cancel_callback=None) -> None:
     last_error: Exception | None = None
     for attempt in range(1, 4):
         try:
+            log(f"[*] X.com 注册页识别尝试 {attempt}/3")
             if attempt > 1:
                 engine.restart_browser(log_callback=log, cancel_callback=cancel)
             elif engine._active_browser() is None:
@@ -325,6 +553,10 @@ def open_signup_page(log_callback=None, cancel_callback=None) -> None:
             raise
         except Exception as exc:
             last_error = exc
+            log(
+                f"[诊断] X.com 注册页识别第 {attempt}/3 次失败: "
+                f"{type(exc).__name__}: {exc}"
+            )
             if attempt < 3:
                 log(f"[!] 打开 X.com 注册页失败，重启浏览器后重试 ({attempt + 1}/3): {exc}")
     raise XAccountRegistrationError(f"打开 X.com 注册页失败: {last_error or 'unknown'}")
@@ -496,9 +728,7 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     _runtime.last_profile = profile
 
     name_input = _find(page, NAME_INPUT_SELECTORS)
-    email_first_input = None if name_input is not None else _find(
-        page, EMAIL_FIRST_INPUT_SELECTORS
-    )
+    email_first_input = None if name_input is not None else _find_email_first_input(page)
 
     if email_first_input is not None:
         _fill(email_first_input, email)
