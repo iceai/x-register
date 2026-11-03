@@ -13,7 +13,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 
 from backend.registration import engine
 from backend.registration.signup_flow import AccountAlreadyRegistered, build_profile
@@ -42,6 +42,11 @@ EMAIL_FIRST_INPUT_SELECTORS = (
     "input[autocomplete='username']",
     "input[data-testid='ocfEnterTextTextInput']",
     "input[name='text']",
+)
+UNIFIED_IDENTITY_INPUT_SELECTORS = (
+    "input[name='username_or_email']",
+    "input[autocomplete='username webauthn']",
+    "input[autocomplete~='webauthn']",
 )
 CREATE_ACCOUNT_SELECTORS = (
     "[data-testid='ocfSignupButton']",
@@ -201,6 +206,10 @@ def _find(page: Any, selectors: Iterable[str]) -> Any | None:
 
 def _find_email_first_input(page: Any) -> Any | None:
     """Locate X's email-first textbox even when attributes or frame placement change."""
+    # X's unified landing uses this control for the begin_login API. Despite the
+    # visible "Email or username" copy, it is not an email-registration field.
+    if _find(page, UNIFIED_IDENTITY_INPUT_SELECTORS) is not None:
+        return None
     locator = _find(page, EMAIL_FIRST_INPUT_SELECTORS)
     if locator is not None:
         return locator
@@ -281,20 +290,10 @@ def _find_exact_text_button(page: Any, labels: Iterable[str]) -> Any | None:
 
 def _is_unified_signup_landing(page: Any) -> bool:
     """Return true for X's new signup modal whose email box actually logs in."""
-    try:
-        query = parse_qs(urlsplit(str(page.url or "")).query)
-    except Exception:
-        query = {}
-    mode = str((query.get("mode") or [""])[0]).strip().lower()
-    if mode != "signup":
-        return False
-    return _find(
-        page,
-        (
-            "input[name='username_or_email']",
-            "input[autocomplete='username webauthn']",
-        ),
-    ) is not None
+    # X initially redirects with ?mode=signup, then removes the query string
+    # while keeping the same React view. The stable discriminator is the exact
+    # identity control used by jf.x.com's begin_login action.
+    return _find(page, UNIFIED_IDENTITY_INPUT_SELECTORS) is not None
 
 
 def _enter_email_signup_from_unified_landing(
@@ -627,12 +626,18 @@ def _prepare_signup_form(page: Any, log: Callable[[str], None], cancel: Callable
     # Create account 入口，避免邮箱优先表单稍晚出现时被误判为按钮缺失。
     first_control = _wait_for(
         page,
-        NAME_INPUT_SELECTORS + EMAIL_FIRST_INPUT_SELECTORS + CREATE_ACCOUNT_SELECTORS,
+        NAME_INPUT_SELECTORS
+        + UNIFIED_IDENTITY_INPUT_SELECTORS
+        + EMAIL_FIRST_INPUT_SELECTORS
+        + CREATE_ACCOUNT_SELECTORS,
         timeout=20,
         cancel=cancel,
     )
     if _find(page, NAME_INPUT_SELECTORS) is not None:
         log("[*] 已识别 X.com 资料优先注册页")
+        return
+    if _is_unified_signup_landing(page):
+        _enter_email_signup_from_unified_landing(page, log, cancel)
         return
     if _find_email_first_input(page) is not None:
         log("[*] 已识别 X.com 邮箱优先注册页")

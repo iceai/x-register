@@ -95,6 +95,23 @@ class XAccountRegistrationTests(unittest.TestCase):
 
         enter.assert_called_once_with(page, log, cancel)
 
+    def test_unified_signup_detection_does_not_require_mode_query(self):
+        page = mock.Mock()
+        page.url = "https://x.com/i/jf/onboarding/web"
+        identity_input = mock.Mock()
+
+        with mock.patch.object(flow, "_find", return_value=identity_input):
+            self.assertTrue(flow._is_unified_signup_landing(page))
+
+    def test_email_first_detection_rejects_unified_login_control(self):
+        page = mock.Mock()
+        identity_input = mock.Mock()
+
+        with mock.patch.object(flow, "_find", return_value=identity_input) as find:
+            self.assertIsNone(flow._find_email_first_input(page))
+
+        find.assert_called_once_with(page, flow.UNIFIED_IDENTITY_INPUT_SELECTORS)
+
     def test_unified_signup_without_email_switch_reports_phone_requirement(self):
         page = mock.Mock()
         phone_button = mock.Mock()
