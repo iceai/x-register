@@ -38,6 +38,8 @@ EMAIL_INPUT_SELECTORS = (
 # “Email or username”。新版输入框目前使用 name=text，另外保留可访问属性选择器，
 # 避免只依赖易变的 CSS class。
 EMAIL_FIRST_INPUT_SELECTORS = (
+    "[role='dialog'] input[name='username_or_email']",
+    "[role='dialog'] input[autocomplete='username webauthn']",
     "input[name='username_or_email']",
     "input[autocomplete='username webauthn']",
     "input[autocomplete~='webauthn']",
@@ -448,37 +450,84 @@ def _click_exact_action(
     ]
     for _scope_label, scope in _iter_page_scopes(page):
         try:
-            clicked = scope.evaluate(
-                """expected => {
+            controls = scope.locator(
+                "button, [role='button'], a, [role='link'], [tabindex='0']"
+            )
+            states = controls.evaluate_all(
+                """(elements, expected) => {
                     const normalize = value => String(value || '')
                         .replace(/\\s+/g, ' ').trim().toLocaleLowerCase();
                     const allowed = new Set(expected);
-                    const controls = document.querySelectorAll(
-                        "button, [role='button'], a, [role='link'], [tabindex='0']"
-                    );
-                    for (const target of controls) {
+                    return elements.map((target, index) => {
                         const style = getComputedStyle(target);
                         const rect = target.getBoundingClientRect();
                         const visible = style.display !== 'none'
                             && style.visibility !== 'hidden'
                             && Number(style.opacity || 0) > 0.01
                             && rect.width > 0 && rect.height > 0;
-                        if (!visible || !allowed.has(normalize(target.innerText))) continue;
-                        if (target.disabled || target.getAttribute('aria-disabled') === 'true') {
-                            continue;
-                        }
-                        target.click();
-                        return true;
-                    }
-                    return false;
+                        return {
+                            index,
+                            exact: allowed.has(normalize(target.innerText)),
+                            visible,
+                            enabled: !target.disabled
+                                && target.getAttribute('aria-disabled') !== 'true',
+                            inDialog: Boolean(target.closest("[role='dialog']")),
+                        };
+                    });
                 }""",
                 expected,
             )
-            if bool(clicked):
-                return True
         except Exception:
             continue
+        matches = [
+            item
+            for item in (states if isinstance(states, list) else [])
+            if isinstance(item, dict)
+            and bool(item.get("exact"))
+            and bool(item.get("visible"))
+            and bool(item.get("enabled"))
+        ]
+        matches.sort(key=lambda item: bool(item.get("inDialog")), reverse=True)
+        for item in matches:
+            try:
+                controls.nth(int(item["index"])).click(timeout=10_000)
+                return True
+            except Exception:
+                continue
     return False
+
+
+def _fill_email_input(input_locator: Any, email: str) -> None:
+    """Paste an email atomically and synchronize React's controlled state."""
+    input_locator.fill(email)
+    try:
+        input_locator.evaluate(
+            """(element, value) => {
+                const previous = element.value;
+                const setter = Object.getOwnPropertyDescriptor(
+                    HTMLInputElement.prototype, 'value'
+                )?.set;
+                if (setter) setter.call(element, value);
+                else element.value = value;
+                if (element._valueTracker) element._valueTracker.setValue(previous);
+                element.dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    inputType: 'insertFromPaste',
+                    data: value,
+                }));
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+            }""",
+            email,
+        )
+    except Exception:
+        pass
+    time.sleep(0.25)
+    try:
+        value = str(input_locator.input_value() or "")
+    except Exception as exc:
+        raise XAccountRegistrationError("无法读取 X.com 邮箱输入值") from exc
+    if value.strip() != email:
+        raise XAccountRegistrationError("X.com 邮箱输入值校验失败，已停止提交")
 
 
 def _is_unified_signup_landing(page: Any) -> bool:
@@ -949,6 +998,7 @@ def _wait_for_email_verification_step(
     """等待邮箱验证码页，同时兼容邮箱之后才出现资料表单的新版流程。"""
     deadline = time.time() + max(float(timeout), 1.0)
     profile_submitted = False
+    nested_email_submissions = 0
     while time.time() < deadline:
         _cancelled(cancel)
         reason = _challenge_reason(page)
@@ -964,6 +1014,19 @@ def _wait_for_email_verification_step(
             # 新邮箱在完成邮箱验证码之前不应直接进入密码页；这种情况通常表示
             # 邮箱已属于现有账号，不能把登录流程误记成注册成功。
             raise AccountAlreadyRegistered(f"X.com 邮箱已注册: {email}")
+        nested_email_input = _find_email_first_input(page)
+        if nested_email_input is not None and nested_email_submissions < 2:
+            try:
+                current_email_value = str(nested_email_input.input_value() or "").strip()
+            except Exception:
+                current_email_value = ""
+            if current_email_value != email:
+                _fill_email_input(nested_email_input, email)
+                _next(page, cancel=cancel)
+                nested_email_submissions += 1
+                _runtime_log("[*] 已在 X.com 顶层注册弹窗中再次提交邮箱")
+                time.sleep(0.75)
+                continue
         if not profile_submitted and _find(page, NAME_INPUT_SELECTORS) is not None:
             _fill_name_and_birthdate_if_present(
                 page,
@@ -1028,23 +1091,9 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
         # Match the successful manual flow's paste semantics. Sequential typing
         # can corrupt the portion before/around '@' under some Camoufox keyboard
         # layouts, turning an address into a short username such as "he.im".
-        email_first_input.fill(email)
-        time.sleep(0.25)
+        _fill_email_input(email_first_input, email)
         log(f"[*] 已创建邮箱并填写 X.com 邮箱优先注册页: {email}")
         verification_requested_at = time.time() - 5
-        try:
-            filled_value = str(email_first_input.input_value() or "")
-        except Exception:
-            filled_value = email
-        if filled_value.strip() != email:
-            email_first_input.fill(email)
-            time.sleep(0.25)
-            try:
-                filled_value = str(email_first_input.input_value() or "")
-            except Exception:
-                filled_value = ""
-        if filled_value.strip() != email:
-            raise XAccountRegistrationError("X.com 邮箱输入值校验失败，已停止提交")
         submitted_from = str(page.url or "")
         _next(page, cancel=cancel)
         log(f"[*] 已点击 X.com 邮箱 Continue，提交页: {_safe_diagnostic_url(submitted_from)}")

@@ -189,7 +189,19 @@ class XAccountRegistrationTests(unittest.TestCase):
 
     def test_text_fallback_rejects_continue_inside_phone_button(self):
         page = mock.Mock()
-        page.evaluate.return_value = True
+        controls = mock.Mock()
+        standalone = mock.Mock()
+        controls.evaluate_all.return_value = [
+            {
+                "index": 1,
+                "exact": True,
+                "visible": True,
+                "enabled": True,
+                "inDialog": False,
+            }
+        ]
+        controls.nth.return_value = standalone
+        page.locator.return_value = controls
 
         with mock.patch.object(flow, "_find_exact_text_button", return_value=None):
             clicked = flow._click_exact_action(
@@ -199,9 +211,10 @@ class XAccountRegistrationTests(unittest.TestCase):
             )
 
         self.assertTrue(clicked)
-        expression, expected = page.evaluate.call_args.args
+        expression, expected = controls.evaluate_all.call_args.args
         self.assertIn("allowed.has(normalize(target.innerText))", expression)
         self.assertEqual(expected, ["continue"])
+        standalone.click.assert_called_once_with(timeout=10_000)
 
     def test_email_first_variant_submits_email_before_profile(self):
         page = mock.Mock()
