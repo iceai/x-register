@@ -25,6 +25,42 @@ result_source = "x_account"
 result_platform = "x"
 batch_source = "x-account-web"
 force_workers = 1
+NAME_INPUT_SELECTORS = ("input[name='name']", "input[autocomplete='name']")
+EMAIL_INPUT_SELECTORS = (
+    "input[name='email']",
+    "input[autocomplete='email']",
+)
+# X.com 会按地区/出口返回两种首屏：旧版先填姓名与生日，新版先显示
+# “Email or username”。新版输入框目前使用 name=text，另外保留可访问属性选择器，
+# 避免只依赖易变的 CSS class。
+EMAIL_FIRST_INPUT_SELECTORS = (
+    "input[aria-label='Email or username']",
+    "input[placeholder='Email or username']",
+    "input[aria-label='邮箱或用户名']",
+    "input[placeholder='邮箱或用户名']",
+    "input[autocomplete='username']",
+    "input[data-testid='ocfEnterTextTextInput']",
+    "input[name='text']",
+)
+CREATE_ACCOUNT_SELECTORS = (
+    "[data-testid='ocfSignupButton']",
+    "a[href='/i/flow/signup']",
+    "[role='button']:has-text('Create account')",
+    "[role='button']:has-text('创建账号')",
+)
+CODE_INPUT_SELECTORS = (
+    "input[name='verfication_code']",
+    "input[name='verification_code']",
+    "input[autocomplete='one-time-code']",
+)
+PHONE_INPUT_SELECTORS = (
+    "input[name='phone_number']",
+    "input[autocomplete='tel']",
+)
+PASSWORD_INPUT_SELECTORS = (
+    "input[name='password']",
+    "input[autocomplete='new-password']",
+)
 FAILURE_LABELS = {
     "manual_challenge": "人工安全验证",
     "phone_required": "需要手机号",
@@ -171,6 +207,12 @@ def _next(page: Any, *, required: bool = True, cancel: Callable[[], bool]) -> bo
         (
             "[data-testid='ocfEnterTextNextButton']",
             "[data-testid='ocfSignupReviewNextButton']",
+            # :text-is() 是精确匹配，不能用 :has-text('Continue')；否则会误点
+            # 首屏更靠前的 “Continue with phone/Google/Apple”。
+            "button:text-is('Continue')",
+            "[role='button']:text-is('Continue')",
+            "button:text-is('继续')",
+            "[role='button']:text-is('继续')",
             "button:has-text('Next')",
             "[role='button']:has-text('Next')",
             "button:has-text('下一步')",
@@ -185,19 +227,44 @@ def _next(page: Any, *, required: bool = True, cancel: Callable[[], bool]) -> bo
 def _prepare_signup_form(page: Any, log: Callable[[str], None], cancel: Callable[[], bool]) -> None:
     page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=45_000)
     log("[*] 已打开 X.com 官方注册页")
-    if _find(page, ("input[name='name']", "input[autocomplete='name']")) is None:
-        _click(
-            page,
-            (
-                "[data-testid='ocfSignupButton']",
-                "a[href='/i/flow/signup']",
-                "[role='button']:has-text('Create account')",
-                "[role='button']:has-text('创建账号')",
-            ),
-            timeout=20,
-            cancel=cancel,
-        )
-    _wait_for(page, ("input[name='name']", "input[autocomplete='name']"), cancel=cancel)
+    if _find(page, NAME_INPUT_SELECTORS) is not None:
+        log("[*] 已识别 X.com 资料优先注册页")
+        return
+    if _find(page, EMAIL_FIRST_INPUT_SELECTORS) is not None:
+        log("[*] 已识别 X.com 邮箱优先注册页")
+        return
+
+    # domcontentloaded 时 React 表单可能尚未渲染。先同时等待两种表单和旧版
+    # Create account 入口，避免邮箱优先表单稍晚出现时被误判为按钮缺失。
+    first_control = _wait_for(
+        page,
+        NAME_INPUT_SELECTORS + EMAIL_FIRST_INPUT_SELECTORS + CREATE_ACCOUNT_SELECTORS,
+        timeout=20,
+        cancel=cancel,
+    )
+    if _find(page, NAME_INPUT_SELECTORS) is not None:
+        log("[*] 已识别 X.com 资料优先注册页")
+        return
+    if _find(page, EMAIL_FIRST_INPUT_SELECTORS) is not None:
+        log("[*] 已识别 X.com 邮箱优先注册页")
+        return
+
+    first_control.click(timeout=20_000)
+    first_input = _wait_for(
+        page,
+        NAME_INPUT_SELECTORS + EMAIL_FIRST_INPUT_SELECTORS,
+        cancel=cancel,
+    )
+    try:
+        input_name = str(first_input.get_attribute("name") or "").lower()
+        input_label = str(first_input.get_attribute("aria-label") or "").lower()
+    except Exception:
+        input_name = ""
+        input_label = ""
+    if input_name == "text" or "email" in input_label or "邮箱" in input_label:
+        log("[*] 已识别 X.com 邮箱优先注册页")
+    else:
+        log("[*] 已识别 X.com 资料优先注册页")
 
 
 def last_acquired_email() -> str:
@@ -303,6 +370,115 @@ def _raise_if_email_rejected(page: Any, email: str) -> None:
         raise engine.EmailDomainRejected(email, "X.com 拒绝当前邮箱")
 
 
+def _fill_name_and_birthdate_if_present(
+    page: Any,
+    profile: dict[str, str],
+    *,
+    cancel: Callable[[], bool],
+    require_birthdate: bool,
+) -> bool:
+    """填写当前可见的资料表单；邮箱优先流程允许姓名与生日分步出现。"""
+    name_input = _find(page, NAME_INPUT_SELECTORS)
+    if name_input is None:
+        return False
+    _fill(name_input, str(profile.get("display_name") or ""))
+    try:
+        select_count = int(page.locator("select").count())
+    except Exception:
+        select_count = 0
+    if select_count >= 3:
+        profile["birthdate"] = _set_birthdate(page)
+    elif require_birthdate:
+        raise XAccountRegistrationError("X.com 出生日期控件未出现")
+    _runtime.last_profile = profile
+    _next(page, cancel=cancel)
+    return True
+
+
+def _fill_standalone_birthdate_if_present(
+    page: Any,
+    profile: dict[str, str],
+    *,
+    cancel: Callable[[], bool],
+) -> bool:
+    """兼容新版流程把出生日期拆成姓名之后的独立页面。"""
+    try:
+        select_count = int(page.locator("select").count())
+    except Exception:
+        return False
+    if select_count < 3:
+        return False
+    profile["birthdate"] = _set_birthdate(page)
+    _runtime.last_profile = profile
+    _next(page, cancel=cancel)
+    return True
+
+
+def _wait_for_email_verification_step(
+    page: Any,
+    email: str,
+    profile: dict[str, str],
+    *,
+    timeout: float,
+    cancel: Callable[[], bool],
+) -> None:
+    """等待邮箱验证码页，同时兼容邮箱之后才出现资料表单的新版流程。"""
+    deadline = time.time() + max(float(timeout), 1.0)
+    profile_submitted = False
+    while time.time() < deadline:
+        _cancelled(cancel)
+        reason = _challenge_reason(page)
+        if reason:
+            raise ManualChallengeRequired(reason)
+        _raise_if_email_rejected(page, email)
+
+        if _find(page, CODE_INPUT_SELECTORS + ("input[type='tel']",)) is not None:
+            return
+        if _find(page, PHONE_INPUT_SELECTORS) is not None:
+            raise PhoneVerificationRequired("X.com 要求手机号验证，当前任务仅配置了邮箱注册")
+        if _find(page, PASSWORD_INPUT_SELECTORS) is not None:
+            # 新邮箱在完成邮箱验证码之前不应直接进入密码页；这种情况通常表示
+            # 邮箱已属于现有账号，不能把登录流程误记成注册成功。
+            raise AccountAlreadyRegistered(f"X.com 邮箱已注册: {email}")
+        if not profile_submitted and _find(page, NAME_INPUT_SELECTORS) is not None:
+            _fill_name_and_birthdate_if_present(
+                page,
+                profile,
+                cancel=cancel,
+                require_birthdate=False,
+            )
+            profile_submitted = True
+            time.sleep(0.75)
+            continue
+        if _fill_standalone_birthdate_if_present(
+            page,
+            profile,
+            cancel=cancel,
+        ):
+            profile_submitted = True
+            time.sleep(0.75)
+            continue
+
+        # 资料确认/个性化页面的按钮因地区不同可能显示 Sign up 或 Next。
+        if _click(
+            page,
+            (
+                "[data-testid='ocfSignupReviewNextButton']",
+                "[role='button']:text-is('Sign up')",
+                "button:text-is('Sign up')",
+                "[role='button']:text-is('注册')",
+                "button:text-is('注册')",
+            ),
+            timeout=1,
+            required=False,
+            cancel=cancel,
+        ):
+            time.sleep(0.75)
+            continue
+        time.sleep(0.25)
+    raise XAccountRegistrationError("提交邮箱后等待 X.com 验证码页面超时")
+
+
 def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     log = log_callback or (lambda _message: None)
     cancel = cancel_callback or (lambda: False)
@@ -319,15 +495,35 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     }
     _runtime.last_profile = profile
 
-    name_input = _wait_for(
-        page,
-        ("input[name='name']", "input[autocomplete='name']"),
-        timeout=timeout,
-        cancel=cancel,
+    name_input = _find(page, NAME_INPUT_SELECTORS)
+    email_first_input = None if name_input is not None else _find(
+        page, EMAIL_FIRST_INPUT_SELECTORS
     )
+
+    if email_first_input is not None:
+        _fill(email_first_input, email)
+        log(f"[*] 已创建邮箱并填写 X.com 邮箱优先注册页: {email}")
+        verification_requested_at = time.time() - 5
+        _next(page, cancel=cancel)
+        _wait_for_email_verification_step(
+            page,
+            email,
+            profile,
+            timeout=timeout,
+            cancel=cancel,
+        )
+        return email, mail_token, verification_requested_at
+
+    if name_input is None:
+        name_input = _wait_for(
+            page,
+            NAME_INPUT_SELECTORS,
+            timeout=timeout,
+            cancel=cancel,
+        )
     _fill(name_input, display_name)
 
-    email_input = _find(page, ("input[name='email']", "input[autocomplete='email']"))
+    email_input = _find(page, EMAIL_INPUT_SELECTORS)
     if email_input is None:
         _click(
             page,
@@ -341,7 +537,7 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
             cancel=cancel,
         )
         email_input = _wait_for(
-            page, ("input[name='email']", "input[autocomplete='email']"), cancel=cancel
+            page, EMAIL_INPUT_SELECTORS, cancel=cancel
         )
     _fill(email_input, email)
     birthdate = _set_birthdate(page)
@@ -357,9 +553,7 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
         if _find(
             page,
             (
-                "input[name='verfication_code']",
-                "input[name='verification_code']",
-                "input[autocomplete='one-time-code']",
+                *CODE_INPUT_SELECTORS,
             ),
         ) is not None:
             break
@@ -384,19 +578,13 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     _raise_if_email_rejected(page, email)
     if _find(
         page,
-        ("input[name='phone_number']", "input[autocomplete='tel']"),
+        PHONE_INPUT_SELECTORS,
     ) is not None:
         raise PhoneVerificationRequired("X.com 要求手机号验证，当前任务仅配置了邮箱注册")
 
     _wait_for(
         page,
-        (
-            "input[name='verfication_code']",
-            "input[name='verification_code']",
-            "input[autocomplete='one-time-code']",
-            "input[type='tel']",
-            "input[name='phone_number']",
-        ),
+        CODE_INPUT_SELECTORS + ("input[type='tel']",) + PHONE_INPUT_SELECTORS,
         timeout=timeout,
         cancel=cancel,
     )
@@ -417,13 +605,7 @@ def fill_code_and_submit(
 
     verification_input = _wait_for(
         page,
-        (
-            "input[name='verfication_code']",
-            "input[name='verification_code']",
-            "input[autocomplete='one-time-code']",
-            "input[type='tel']",
-            "input[name='phone_number']",
-        ),
+        CODE_INPUT_SELECTORS + ("input[type='tel']",) + PHONE_INPUT_SELECTORS,
         timeout=min(max(float(timeout), 1), 45),
         cancel=cancel,
     )
@@ -468,12 +650,38 @@ def fill_code_and_submit(
     try:
         _fill(code_input, str(code).replace("-", "").strip())
         _next(page, cancel=cancel)
-        _wait_for(
-            page,
-            ("input[name='password']", "input[autocomplete='new-password']"),
-            timeout=35,
-            cancel=cancel,
-        )
+        deadline = time.time() + 35
+        profile = last_profile()
+        while time.time() < deadline:
+            _cancelled(cancel)
+            reason = _challenge_reason(page)
+            if reason:
+                raise ManualChallengeRequired(reason)
+            if _find(page, PHONE_INPUT_SELECTORS) is not None:
+                raise PhoneVerificationRequired(
+                    "X.com 要求手机号验证，当前任务仅配置了邮箱注册"
+                )
+            if _find(page, PASSWORD_INPUT_SELECTORS) is not None:
+                break
+            if _find(page, NAME_INPUT_SELECTORS) is not None:
+                _fill_name_and_birthdate_if_present(
+                    page,
+                    profile,
+                    cancel=cancel,
+                    require_birthdate=False,
+                )
+                time.sleep(0.75)
+                continue
+            if _fill_standalone_birthdate_if_present(
+                page,
+                profile,
+                cancel=cancel,
+            ):
+                time.sleep(0.75)
+                continue
+            time.sleep(0.25)
+        else:
+            raise XAccountRegistrationError("邮箱验证码通过后，X.com 密码页未出现")
     except engine.RegistrationCancelled:
         raise
     except (ManualChallengeRequired, PhoneVerificationRequired):
@@ -496,7 +704,7 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
 
     password_input = _wait_for(
         page,
-        ("input[name='password']", "input[autocomplete='new-password']"),
+        PASSWORD_INPUT_SELECTORS,
         timeout=min(max(float(timeout), 1), 45),
         cancel=cancel,
     )
@@ -530,7 +738,7 @@ def wait_for_registration_completion(timeout=120, log_callback=None, cancel_call
             raise ManualChallengeRequired(reason)
         if _find(
             page,
-            ("input[name='phone_number']", "input[autocomplete='tel']"),
+            PHONE_INPUT_SELECTORS,
         ) is not None:
             raise PhoneVerificationRequired("X.com 要求手机号验证，当前任务仅配置了邮箱注册")
         body_text = _body_text(page).lower()
@@ -576,15 +784,11 @@ def wait_for_registration_completion(timeout=120, log_callback=None, cancel_call
             continue
         # 密码已提交且进入后续 onboarding，账号已经创建。
         password_gone = _find(
-            page, ("input[name='password']", "input[autocomplete='new-password']")
+            page, PASSWORD_INPUT_SELECTORS
         ) is None
         code_gone = _find(
             page,
-            (
-                "input[name='verfication_code']",
-                "input[name='verification_code']",
-                "input[autocomplete='one-time-code']",
-            ),
+            CODE_INPUT_SELECTORS,
         ) is None
         if (
             time.time() - started_at >= 5

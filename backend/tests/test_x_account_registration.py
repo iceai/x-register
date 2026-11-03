@@ -44,6 +44,74 @@ class XAccountRegistrationTests(unittest.TestCase):
             "phone_required",
         )
 
+    def test_prepare_signup_form_accepts_email_first_variant(self):
+        page = mock.Mock()
+        email_input = mock.Mock()
+        log = mock.Mock()
+        cancel = mock.Mock(return_value=False)
+
+        with (
+            mock.patch.object(flow, "_find", side_effect=[None, email_input]),
+            mock.patch.object(flow, "_click") as click,
+            mock.patch.object(flow, "_wait_for") as wait_for,
+        ):
+            flow._prepare_signup_form(page, log, cancel)
+
+        page.goto.assert_called_once_with(
+            flow.SIGNUP_URL,
+            wait_until="domcontentloaded",
+            timeout=45_000,
+        )
+        click.assert_not_called()
+        wait_for.assert_not_called()
+        log.assert_any_call("[*] 已识别 X.com 邮箱优先注册页")
+
+    def test_next_uses_exact_continue_selector(self):
+        with mock.patch.object(flow, "_click", return_value=True) as click:
+            self.assertTrue(flow._next(object(), cancel=lambda: False))
+
+        selectors = click.call_args.args[1]
+        self.assertIn("button:text-is('Continue')", selectors)
+        self.assertNotIn("button:has-text('Continue')", selectors)
+
+    def test_email_first_variant_submits_email_before_profile(self):
+        page = mock.Mock()
+        email_input = mock.Mock()
+        log = mock.Mock()
+        cancel = mock.Mock(return_value=False)
+
+        with (
+            mock.patch.object(flow, "_raw_page", return_value=page),
+            mock.patch.object(
+                flow,
+                "_new_available_email",
+                return_value=("person@example.com", "mail-token"),
+            ),
+            mock.patch.object(
+                flow,
+                "build_profile",
+                return_value=("Test", "Person", "Strong-password-1"),
+            ),
+            mock.patch.object(
+                flow,
+                "_find",
+                side_effect=[None, email_input],
+            ),
+            mock.patch.object(flow, "_fill") as fill,
+            mock.patch.object(flow, "_next", return_value=True) as next_step,
+            mock.patch.object(flow, "_wait_for_email_verification_step") as wait_step,
+        ):
+            email, token, _submitted_at = flow.fill_email_and_submit(
+                log_callback=log,
+                cancel_callback=cancel,
+            )
+
+        self.assertEqual((email, token), ("person@example.com", "mail-token"))
+        fill.assert_called_once_with(email_input, "person@example.com")
+        next_step.assert_called_once_with(page, cancel=cancel)
+        wait_step.assert_called_once()
+        self.assertEqual(wait_step.call_args.args[1], "person@example.com")
+
 
 if __name__ == "__main__":
     unittest.main()
