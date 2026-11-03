@@ -34,6 +34,20 @@ class XAccountRegistrationTests(unittest.TestCase):
         self.assertIn("人工安全验证", flow._challenge_reason(page))
         page.locator.assert_called_with("iframe[src*='arkose']")
 
+    def test_visible_rejects_transparent_preloaded_input(self):
+        locator = mock.Mock()
+        locator.count.return_value = 1
+        locator.first.is_visible.return_value = True
+        locator.first.evaluate.return_value = {
+            "display": "block",
+            "visibility": "visible",
+            "opacity": 0,
+            "width": 360,
+            "height": 44,
+        }
+
+        self.assertFalse(flow._visible(locator))
+
     def test_platform_failures_keep_specific_categories(self):
         self.assertEqual(
             flow.classify_failure(flow.ManualChallengeRequired("challenge")),
@@ -66,6 +80,45 @@ class XAccountRegistrationTests(unittest.TestCase):
         click.assert_not_called()
         wait_for.assert_not_called()
         log.assert_any_call("[*] 已识别 X.com 邮箱优先注册页")
+
+    def test_prepare_signup_form_enters_unified_signup_branch(self):
+        page = mock.Mock()
+        log = mock.Mock()
+        cancel = mock.Mock(return_value=False)
+
+        with (
+            mock.patch.object(flow, "_find", return_value=None),
+            mock.patch.object(flow, "_is_unified_signup_landing", return_value=True),
+            mock.patch.object(flow, "_enter_email_signup_from_unified_landing") as enter,
+        ):
+            flow._prepare_signup_form(page, log, cancel)
+
+        enter.assert_called_once_with(page, log, cancel)
+
+    def test_unified_signup_without_email_switch_reports_phone_requirement(self):
+        page = mock.Mock()
+        phone_button = mock.Mock()
+        phone_input = mock.Mock()
+        log = mock.Mock()
+        cancel = mock.Mock(return_value=False)
+
+        with (
+            mock.patch.object(
+                flow,
+                "_find_exact_text_button",
+                side_effect=[phone_button, None, None],
+            ),
+            mock.patch.object(flow, "_find", side_effect=[None, phone_input]),
+            mock.patch.object(flow.time, "sleep"),
+        ):
+            with self.assertRaises(flow.PhoneVerificationRequired):
+                flow._enter_email_signup_from_unified_landing(
+                    page,
+                    log,
+                    cancel,
+                )
+
+        phone_button.click.assert_called_once_with(timeout=10_000)
 
     def test_next_uses_exact_continue_selector(self):
         with (

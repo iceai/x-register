@@ -13,7 +13,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from backend.registration import engine
 from backend.registration.signup_flow import AccountAlreadyRegistered, build_profile
@@ -56,7 +56,9 @@ CODE_INPUT_SELECTORS = (
 )
 PHONE_INPUT_SELECTORS = (
     "input[name='phone_number']",
+    "input[name='phone']",
     "input[autocomplete='tel']",
+    "input[inputmode='tel']",
 )
 PASSWORD_INPUT_SELECTORS = (
     "input[name='password']",
@@ -150,9 +152,39 @@ def _cancelled(cancel: Callable[[], bool] | None) -> None:
 
 def _visible(locator: Any) -> bool:
     try:
-        return bool(locator.count()) and bool(locator.first.is_visible())
+        if not bool(locator.count()) or not bool(locator.first.is_visible()):
+            return False
+        # Playwright deliberately considers opacity:0 elements visible. X keeps
+        # a transparent password input under the email/username field, so using
+        # is_visible() alone mistakes the preloaded login control for a new step.
+        rendered = locator.first.evaluate(
+            """element => {
+                const style = getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return {
+                    display: style.display,
+                    visibility: style.visibility,
+                    opacity: Number(style.opacity || 0),
+                    width: rect.width,
+                    height: rect.height,
+                };
+            }"""
+        )
+        if isinstance(rendered, dict):
+            if rendered.get("display") == "none" or rendered.get("visibility") == "hidden":
+                return False
+            if float(rendered.get("opacity", 1) or 0) <= 0.01:
+                return False
+            if float(rendered.get("width", 0) or 0) <= 0 or float(
+                rendered.get("height", 0) or 0
+            ) <= 0:
+                return False
+        return True
     except Exception:
-        return False
+        try:
+            return bool(locator.count()) and bool(locator.first.is_visible())
+        except Exception:
+            return False
 
 
 def _find(page: Any, selectors: Iterable[str]) -> Any | None:
@@ -245,6 +277,92 @@ def _find_exact_text_button(page: Any, labels: Iterable[str]) -> Any | None:
             except Exception:
                 continue
     return None
+
+
+def _is_unified_signup_landing(page: Any) -> bool:
+    """Return true for X's new signup modal whose email box actually logs in."""
+    try:
+        query = parse_qs(urlsplit(str(page.url or "")).query)
+    except Exception:
+        query = {}
+    mode = str((query.get("mode") or [""])[0]).strip().lower()
+    if mode != "signup":
+        return False
+    return _find(
+        page,
+        (
+            "input[name='username_or_email']",
+            "input[autocomplete='username webauthn']",
+        ),
+    ) is not None
+
+
+def _enter_email_signup_from_unified_landing(
+    page: Any,
+    log: Callable[[str], None],
+    cancel: Callable[[], bool],
+) -> None:
+    """Enter X's actual signup branch and switch from phone to email when offered."""
+    log("[*] 已识别 X.com 新版统一登录/注册页，进入官方注册分支")
+    deadline = time.time() + 12
+    phone_entry = None
+    while time.time() < deadline:
+        _cancelled(cancel)
+        phone_entry = _find_exact_text_button(
+            page,
+            ("Continue with phone", "使用手机号继续"),
+        )
+        if phone_entry is not None:
+            break
+        time.sleep(0.25)
+    if phone_entry is None:
+        _emit_timeout_diagnostics(page, ("button:has-text('Continue with phone')",))
+        raise XAccountRegistrationError("X.com 新版注册入口未出现")
+    phone_entry.click(timeout=10_000)
+
+    # Older variants expose Use email instead after entering the phone branch.
+    # Current X may omit it entirely and require SMS; do not consume a temporary
+    # email until we have confirmed that an email registration form exists.
+    phone_input = None
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        _cancelled(cancel)
+        email_input = _find(page, EMAIL_INPUT_SELECTORS)
+        if email_input is not None:
+            log("[*] X.com 注册分支已提供邮箱输入框")
+            return
+        use_email = _find_exact_text_button(
+            page,
+            ("Use email instead", "使用邮箱", "改用电子邮件"),
+        )
+        if use_email is not None:
+            use_email.click(timeout=10_000)
+            _wait_for(page, EMAIL_INPUT_SELECTORS, timeout=12, cancel=cancel)
+            log("[*] 已从 X.com 手机注册页切换为邮箱注册")
+            return
+        phone_input = _find(page, PHONE_INPUT_SELECTORS)
+        if phone_input is not None:
+            # Give late-rendered alternatives a short chance to appear.
+            time.sleep(2)
+            use_email = _find_exact_text_button(
+                page,
+                ("Use email instead", "使用邮箱", "改用电子邮件"),
+            )
+            if use_email is not None:
+                use_email.click(timeout=10_000)
+                _wait_for(page, EMAIL_INPUT_SELECTORS, timeout=12, cancel=cancel)
+                log("[*] 已从 X.com 手机注册页切换为邮箱注册")
+                return
+            break
+        time.sleep(0.25)
+
+    if phone_input is not None:
+        raise PhoneVerificationRequired(
+            "X.com 当前官方注册页仅提供手机号和短信验证，没有“Use email instead”；"
+            "临时邮箱无法单独完成本次注册"
+        )
+    _emit_timeout_diagnostics(page, PHONE_INPUT_SELECTORS + EMAIL_INPUT_SELECTORS)
+    raise XAccountRegistrationError("进入 X.com 官方注册分支后未出现手机号或邮箱控件")
 
 
 def _diagnostic_attr(locator: Any, name: str) -> str:
@@ -497,6 +615,9 @@ def _prepare_signup_form(page: Any, log: Callable[[str], None], cancel: Callable
     log("[*] 已打开 X.com 官方注册页")
     if _find(page, NAME_INPUT_SELECTORS) is not None:
         log("[*] 已识别 X.com 资料优先注册页")
+        return
+    if _is_unified_signup_landing(page):
+        _enter_email_signup_from_unified_landing(page, log, cancel)
         return
     if _find_email_first_input(page) is not None:
         log("[*] 已识别 X.com 邮箱优先注册页")
